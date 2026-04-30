@@ -112,7 +112,24 @@ def background_polling_loop():
                 old_val = last_state.get(cell_ref)
                 
                 # Only log if value actually changed and we have both values
-                if old_val and new_val and new_val != old_val:
+                if old_val and new_val and str(new_val) != str(old_val):
+                    # --- ANTI-DUPLICATE CHECK ---
+                    is_duplicate = False
+                    if cell_ref == "C39":
+                        dup = db.query(CKSecreterial).filter(CKSecreterial.total_amount == str(new_val), CKSecreterial.filename == "Manual Entry").order_by(CKSecreterial.timestamp.desc()).first()
+                    elif cell_ref == "C42":
+                        dup = db.query(SPTable).filter(SPTable.total_amount == str(new_val), SPTable.filename == "Manual Entry").order_by(SPTable.timestamp.desc()).first()
+                    elif cell_ref == "C68":
+                        dup = db.query(FWLTable).filter(FWLTable.total_payable == str(new_val), FWLTable.filename == "Manual Entry").order_by(FWLTable.timestamp.desc()).first()
+                    
+                    if dup and (datetime.utcnow() - dup.timestamp).total_seconds() < 45:
+                        is_duplicate = True
+                    
+                    if is_duplicate:
+                        logger.info(f"Skipping duplicate log for {cell_ref}: {new_val}")
+                        continue
+
+                    # --- PROCEED WITH LOGGING ---
                     row_num = re.findall(r'\d+', cell_ref)[0]
                     label_val = new_state.get(f"A{row_num}", "Manual Update")
                     
