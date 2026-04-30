@@ -1,6 +1,6 @@
 streamlit==1.57.0
 google-cloud-documentai==3.14.0
-google-oauth2==0.0.1
+google-auth==2.49.2
 pandas==3.0.2
 gspread==6.2.1
 protobuf==7.34.1
