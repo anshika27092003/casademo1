@@ -287,6 +287,27 @@ def extract_invoice_data(text, filename=""):
         if found_particulars and len(line) > 5: remarks_lines.append(line)
     data['remarks'] = " | ".join(remarks_lines) if remarks_lines else "Not Found"
     
+    # 7. --- FIRMUS CAP SPECIALIST BLOCK ---
+    if "Firmus" in data.get('supplier_name', ''):
+        # Invoice No: Tax Invoice No : [VALUE]
+        m_no = re.search(r"(?i)Tax\s+Invoice\s+No\s*:\s*([A-Z0-9]+)", text)
+        if m_no: data['invoice_no'] = m_no.group(1)
+        
+        # Date: Tax Invoice Date : [VALUE]
+        m_date = re.search(r"(?i)Tax\s+Invoice\s+Date\s*:\s*([\d\/]+)", text)
+        if m_date: data['invoice_date'] = m_date.group(1)
+        
+        # Clinic: Look for CASA DENTAL (...) PTE LTD
+        m_clinic = re.search(r"(?i)(CASA\s+DENTAL\s+\([^\)]+\)\s+PTE\s+LTD)", text)
+        if m_clinic: data['bill_to'] = m_clinic.group(1)
+        
+        # Amounts: Sub Total : [VALUE] / Grand Total : [VALUE]
+        m_sub = re.search(r"(?i)Sub\s+Total\s*:\s*([\d,]+\.\d{2})", text)
+        if m_sub: data['sub_total'] = m_sub.group(1).replace(",", "")
+        
+        m_total = re.search(r"(?i)Grand\s+Total\s*:\s*([\d,]+\.\d{2})", text)
+        if m_total: data['total_amount'] = m_total.group(1).replace(",", "")
+
     return data, category
 
 def process_document(file_content, mime_type):
