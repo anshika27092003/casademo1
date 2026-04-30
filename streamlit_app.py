@@ -186,19 +186,39 @@ def save_to_db(filename, data, category):
 
 def update_google_sheet(amount, category, filename, record_id=None):
     try:
+        if not amount or amount == "Not Found":
+            log_to_ui(f"Cannot sync: Amount is '{amount}'", type="warning")
+            return
+
         mapping = {"CK": "C39", "SP": "C42", "FWL": "C68"}
         labels = {"CK": "CK Secreterial", "SP": "SP (Firmus Cap)", "FWL": "Foreign Worker Levy"}
         cell, label = mapping.get(category, "C39"), labels.get(category, "Item")
+        
         creds = get_credentials()
+        # Ensure correct scopes for gspread
+        scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+        creds = creds.with_scopes(scopes)
+        
         gc = gspread.authorize(creds)
-        sh = gc.open_by_key(SPREADSHEET_ID); worksheet = sh.get_worksheet(0) 
+        sh = gc.open_by_key(SPREADSHEET_ID)
+        # Target the specific SETTLEMENT sheet by GID
+        worksheet = sh.get_worksheet_by_id(305885354) 
+        
         old_val = worksheet.acell(cell).value
         worksheet.update_acell(cell, amount)
+        
         db = SessionLocal()
-        audit_entry = CellChange(sheet_name="Settlement Sheet", cell_reference=cell, label_name=f"{label} (via OCR Batch)" if "Batch" in filename else f"{label} (via OCR: {filename})", old_value=str(old_val), new_value=str(amount), source_table=category, source_id=record_id, timestamp=datetime.utcnow())
+        audit_entry = CellChange(
+            sheet_name="Settlement Sheet", cell_reference=cell,
+            label_name=f"{label} (via OCR Batch)" if "Batch" in filename else f"{label} (via OCR: {filename})",
+            old_value=str(old_val), new_value=str(amount),
+            source_table=category, source_id=record_id, timestamp=datetime.utcnow()
+        )
         db.add(audit_entry); db.commit(); db.close()
-        log_to_ui(f"Updated {cell} with {amount}!", type="success")
-    except Exception as e: log_to_ui(f"Sync Error: {str(e)}", type="error")
+        log_to_ui(f"✅ {label} synced to {cell}: ${amount}", type="success")
+    except Exception as e:
+        log_to_ui(f"Sync Error: {str(e)}", type="error")
+        logger.error(f"Sync failure: {e}")
 
 # --- EXTRACTION & OCR ---
 def extract_invoice_data(text, filename=""):
