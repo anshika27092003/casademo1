@@ -305,15 +305,25 @@ with tab1:
                     if extracted_text:
                         inv_data, category = extract_invoice_data(extracted_text, uploaded_file.name)
                         if category == "SP":
-                            save_to_db(uploaded_file.name, inv_data, "SP"); sp_batch.append(float(inv_data['total_amount']))
+                            # Safety check for float conversion
+                            try:
+                                amt_str = str(inv_data['total_amount']).replace(",", "")
+                                amt_float = float(amt_str)
+                                save_to_db(uploaded_file.name, inv_data, "SP")
+                                sp_batch.append(amt_float)
+                                status.update(label=f"Added to SP Batch: ${amt_float}", state="complete")
+                            except ValueError:
+                                status.update(label=f"Could not read amount in {uploaded_file.name}", state="error")
                         elif category == "FWL":
                             st.session_state['pending_fwl'].append({"filename": uploaded_file.name, "data": inv_data})
+                            status.update(label=f"Pending Confirmation: {uploaded_file.name}", state="complete")
                         else:
                             rec_id = save_to_db(uploaded_file.name, inv_data, category)
                             update_google_sheet(inv_data['total_amount'], category, uploaded_file.name, rec_id)
-                        status.update(label=f"Done: {uploaded_file.name}", state="complete")
+                            status.update(label=f"Synced: {uploaded_file.name}", state="complete")
             if sp_batch:
-                st.session_state['sp_batch_total'] = sum(sp_batch); st.session_state['sp_batch_count'] = len(sp_batch)
+                st.session_state['sp_batch_total'] = sum(sp_batch)
+                st.session_state['sp_batch_count'] = len(sp_batch)
 
         if st.session_state.get('pending_fwl'):
             st.divider(); st.subheader("🏥 Pending FWL Confirmation")
