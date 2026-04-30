@@ -368,22 +368,33 @@ with tab1:
                     extracted_text = process_document(file_bytes, uploaded_file.type)
                     if extracted_text:
                         inv_data, category = extract_invoice_data(extracted_text, uploaded_file.name)
-                        
-                        # Show Debug Info
-                        with st.expander(f"🔍 Debug: Extracted Data for {uploaded_file.name}", expanded=True):
-                            st.json(inv_data)
-                        
-                        if category == "FWL":
+                        if category == "SP":
+                            # Show Debug Info
+                            with st.expander(f"🔍 Debug: Extracted Data for {uploaded_file.name}", expanded=True):
+                                st.json(inv_data)
+                            
+                            # Safety check for float conversion
+                            try:
+                                amt_str = str(inv_data['total_amount']).replace(",", "")
+                                amt_float = float(amt_str)
+                                save_to_db(uploaded_file.name, inv_data, "SP")
+                                sp_batch.append(amt_float)
+                                status.update(label=f"Added to SP Batch: ${amt_float}", state="complete")
+                            except ValueError:
+                                status.update(label=f"Could not read amount in {uploaded_file.name}", state="error")
+                        elif category == "FWL":
                             st.session_state['pending_fwl'].append({"filename": uploaded_file.name, "data": inv_data})
                             status.update(label=f"Pending Confirmation: {uploaded_file.name}", state="complete")
                         else:
-                            # BOTH CK AND SP NOW SYNC INSTANTLY
                             rec_id = save_to_db(uploaded_file.name, inv_data, category)
                             update_google_sheet(inv_data['total_amount'], category, uploaded_file.name, rec_id)
                             status.update(label=f"Synced: {uploaded_file.name}", state="complete")
-            
-            if st.session_state.get('pending_fwl'):
-                st.divider(); st.subheader("🏥 Pending FWL Confirmation")
+            if sp_batch:
+                st.session_state['sp_batch_total'] = sum(sp_batch)
+                st.session_state['sp_batch_count'] = len(sp_batch)
+
+        if st.session_state.get('pending_fwl'):
+            st.divider(); st.subheader("🏥 Pending FWL Confirmation")
             for idx, item in enumerate(st.session_state['pending_fwl']):
                 col_a, col_b, col_c = st.columns([2, 2, 1])
                 with col_a: st.write(f"**File:** {item['filename']}")
