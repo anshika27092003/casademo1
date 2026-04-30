@@ -1,0 +1,5 @@
+streamlit
+google-cloud-documentai
+google-oauth2
+pandas
+gspread

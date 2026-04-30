@@ -1,0 +1,12 @@
+# Database
+*.db
+
+# Credentials
+credentials.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
