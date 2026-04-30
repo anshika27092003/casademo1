@@ -1,5 +1,8 @@
-streamlit
-google-cloud-documentai
-google-oauth2
-pandas
-gspread
+streamlit==1.57.0
+google-cloud-documentai==3.14.0
+google-oauth2==0.0.1
+pandas==3.0.2
+gspread==6.2.1
+protobuf==7.34.1
+grpcio==1.80.0
+sqlalchemy==2.0.38
