@@ -233,8 +233,11 @@ def extract_invoice_data(text, filename=""):
     
     # 3. Extract Invoice No (Supports alphanumeric like INV-123 or 25900519)
     inv_no_match = re.search(r"(?i)(Invoice|Tax\s+Invoice|Inv)\s+No\.\s*[:\s]*([A-Z0-9\-]+)", text)
-    if not inv_no_match: inv_no_match = re.search(r"(?i)Invoice\s+([A-Z0-9\-]+)", text)
-    data['invoice_no'] = inv_no_match.group(2) if inv_no_match else (inv_no_match.group(1) if inv_no_match else "Not Found")
+    if inv_no_match:
+        data['invoice_no'] = inv_no_match.group(2)
+    else:
+        inv_no_match = re.search(r"(?i)Invoice\s+([A-Z0-9\-]+)", text)
+        data['invoice_no'] = inv_no_match.group(1) if inv_no_match else "Not Found"
     
     # 4. Extract Clinic Name (Bill To / Delivered To / Invoice To)
     # Look for CASA DENTAL or the line immediately following the keyword
