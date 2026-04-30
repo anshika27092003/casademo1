@@ -218,6 +218,8 @@ def update_google_sheet(amount, category, filename, record_id=None):
 def extract_invoice_data(text, filename=""):
     data = {'total_amount': "Not Found", 'sub_total': "Not Found", 'gst_amount': "0.00", 'remarks': ""}
     category = "CK"
+    
+    # 1. Determine Category
     if re.search(r"(?i)FWL|Foreign\s+Worker\s+Levy", text) or re.search(r"(?i)FWL", filename):
         category = "FWL"; data['supplier_name'] = "MOM (FWL)"
     elif re.search(r"(?i)Firmus\s+Cap", text) or re.search(r"(?i)SP|Firmus", filename):
@@ -225,30 +227,63 @@ def extract_invoice_data(text, filename=""):
     elif re.search(r"(?i)CK\s+SECRETARIAL", text) or re.search(r"(?i)CK", filename):
         category = "CK"; data['supplier_name'] = "CK SECRETARIAL SERVICES PTE LTD"
     
-    date_match = re.search(r"(?i)Date\s*[:\s]*([\d/]{6,})", text)
-    data['invoice_date'] = date_match.group(1) if date_match else "Not Found"
-    inv_no_match = re.search(r"(?i)(Invoice|Tax\s+Invoice)\s+No\.\s*[:\s]*([\d]+)", text)
-    data['invoice_no'] = inv_no_match.group(2) if inv_no_match else "Not Found"
-    bill_to_match = re.search(r"(?i)(INVOICE|Bill\s+To|Delivered\s+To|Clinic\s+Name)\s*[:\s]*([\w\s]+PTE\s+LTD)", text)
-    if not bill_to_match: bill_to_match = re.search(r"(?i)(CASA\s+DENTAL\s+[\w\s]+PTE\s+LTD)", text)
-    data['bill_to'] = bill_to_match.group(2).strip() if bill_to_match and len(bill_to_match.groups()) > 1 else (bill_to_match.group(1).strip() if bill_to_match else "Not Found")
+    # 2. Extract Date (DD/MM/YYYY, DD-MM-YYYY, or DD MMM YYYY)
+    date_match = re.search(r"(?i)(Date|Dated)\s*[:\s]*([\d\-\/]{6,}|[\d]{1,2}\s+[A-Za-z]{3}\s+[\d]{4})", text)
+    data['invoice_date'] = date_match.group(2) if date_match else "Not Found"
     
+    # 3. Extract Invoice No (Supports alphanumeric like INV-123 or 25900519)
+    inv_no_match = re.search(r"(?i)(Invoice|Tax\s+Invoice|Inv)\s+No\.\s*[:\s]*([A-Z0-9\-]+)", text)
+    if not inv_no_match: inv_no_match = re.search(r"(?i)Invoice\s+([A-Z0-9\-]+)", text)
+    data['invoice_no'] = inv_no_match.group(2) if inv_no_match else (inv_no_match.group(1) if inv_no_match else "Not Found")
+    
+    # 4. Extract Clinic Name (Bill To / Delivered To / Invoice To)
+    # Look for CASA DENTAL or the line immediately following the keyword
+    bill_to_match = re.search(r"(?i)(Bill\s+To|Delivered\s+To|Invoice\s+To|Sold\s+To)\s*[:\s]*([^\n,]+)", text)
+    if bill_to_match:
+        clinic_candidate = bill_to_match.group(2).strip()
+        # If it's short, try to take the next line too
+        if len(clinic_candidate) < 10:
+            lines = text.split('\n')
+            for i, line in enumerate(lines):
+                if bill_to_match.group(1) in line:
+                    if i+1 < len(lines): clinic_candidate = lines[i+1].strip()
+                    break
+        data['bill_to'] = clinic_candidate
+    else:
+        # Fallback: search for known clinic names
+        known_search = re.search(r"(?i)(CASA\s+DENTAL\s+[\w\s]+(PTE\s+LTD)?)", text)
+        data['bill_to'] = known_search.group(1).strip() if known_search else "Not Found"
+    
+    # 5. Extract Amounts
     all_amounts = re.findall(r"[\d,]+\.\d{2}", text)
     lines = [l.strip() for l in text.split('\n') if l.strip()]
     for i, line in enumerate(lines):
-        if re.search(r"(?i)\b(Total|Grand\s*Total|Total\s*Payable)\b", line) and not re.search(r"(?i)sub", line):
-            amt = re.search(r"\$?\s*([\d,]+\.\d{2})", line)
-            if not amt and i+1 < len(lines): amt = re.search(r"^\$?\s*([\d,]+\.\d{2})", lines[i+1])
-            if amt: data['total_amount'] = amt.group(1).replace(",", "")
-    if data['total_amount'] == "Not Found" and all_amounts: data['total_amount'] = all_amounts[-1].replace(",", "")
+        if re.search(r"(?i)\b(Total|Grand\s*Total|Total\s*Payable|Amount\s*Due)\b", line) and not re.search(r"(?i)sub", line):
+            amt = re.search(r"[\d,]+\.\d{2}", line)
+            if not amt and i+1 < len(lines): amt = re.search(r"[\d,]+\.\d{2}", lines[i+1])
+            if amt: data['total_amount'] = amt.group(0).replace(",", "")
+            break
+    if data['total_amount'] == "Not Found" and all_amounts:
+        data['total_amount'] = all_amounts[-1].replace(",", "")
     
+    # Sub Total & GST
+    for line in lines:
+        if re.search(r"(?i)Sub\s*Total", line):
+            amt = re.search(r"[\d,]+\.\d{2}", line)
+            if amt: data['sub_total'] = amt.group(0).replace(",", "")
+        if re.search(r"(?i)GST\s*\(?7%|8%|9%|Amount\)?", line):
+            amt = re.search(r"[\d,]+\.\d{2}", line)
+            if amt: data['gst_amount'] = amt.group(0).replace(",", "")
+
+    # 6. Extract Remarks (Particulars / Description)
     remarks_lines = []
     found_particulars = False
     for line in lines:
-        if re.search(r"(?i)Particulars|Description|Details", line): found_particulars = True; continue
-        if re.search(r"(?i)Sub\s*Total|Total|Payable", line): break
+        if re.search(r"(?i)Particulars|Description|Details|Item", line): found_particulars = True; continue
+        if re.search(r"(?i)Sub\s*Total|Total|Payable|Thank\s+You", line): break
         if found_particulars and len(line) > 5: remarks_lines.append(line)
     data['remarks'] = " | ".join(remarks_lines) if remarks_lines else "Not Found"
+    
     return data, category
 
 def process_document(file_content, mime_type):
