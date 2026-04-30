@@ -280,28 +280,84 @@ with tab1:
 
 with tab2:
     st.subheader("📊 Database Records")
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown("### 📑 CK (C39)")
-        try:
-            db = SessionLocal(); res = db.query(CKSecreterial).order_by(CKSecreterial.timestamp.desc()).all(); db.close()
-            if res: st.dataframe(pd.DataFrame([{"Date": r.invoice_date, "Total": f"${r.total_amount}", "Remarks": r.remarks} for r in res]), use_container_width=True)
-        except: pass
-    with col2:
-        st.markdown("### ⚡ SP (C42)")
-        try:
-            db = SessionLocal(); res = db.query(SPTable).order_by(SPTable.timestamp.desc()).all(); db.close()
-            if res: st.dataframe(pd.DataFrame([{"Clinic": r.clinic_name, "Total": f"${r.total_amount}"} for r in res]), use_container_width=True)
-        except: pass
     
-    st.markdown("### 🏢 FWL (C68)")
+    # CK Secreterial Table
+    st.markdown("### 📑 CK Secreterial (C39)")
     try:
-        db = SessionLocal(); res = db.query(FWLTable).order_by(FWLTable.timestamp.desc()).all(); db.close()
-        if res: st.dataframe(pd.DataFrame([{"Clinic": r.clinic_name, "Total": f"${r.total_payable}", "Time": r.timestamp.strftime("%H:%M")} for r in res]), use_container_width=True)
-    except: pass
+        db = SessionLocal()
+        results = db.query(CKSecreterial).order_by(CKSecreterial.timestamp.desc()).all()
+        db.close()
+        if results:
+            data = [{
+                "ID": r.id,
+                "Filename": r.filename,
+                "Supplier": r.supplier_name,
+                "Consignment No": r.consignment_number,
+                "Invoice Date": r.invoice_date,
+                "Invoice No": r.invoice_no,
+                "Bill To": r.bill_to,
+                "Sub Total": f"${r.sub_total}" if r.sub_total else "N/A",
+                "GST Amount": f"${r.gst_amount}" if r.gst_amount else "N/A",
+                "Total Amount": f"${r.total_amount}",
+                "Remarks": r.remarks,
+                "Time": r.timestamp.strftime("%Y-%m-%d %H:%M:%S")
+            } for r in results]
+            st.dataframe(pd.DataFrame(data), use_container_width=True)
+        else: st.info("No CK records found.")
+    except Exception as e: st.error(str(e))
 
-    st.divider(); st.markdown("### 🔍 Full Audit Trail")
+    # SP Table
+    st.markdown("### ⚡ SP - Firmus Cap (C42)")
     try:
-        db = SessionLocal(); res = db.query(CellChange).order_by(CellChange.timestamp.desc()).limit(50).all(); db.close()
-        if res: st.dataframe(pd.DataFrame([{"Table": r.source_table, "ID": r.source_id, "Cell": r.cell_reference, "Old": r.old_value, "New": r.new_value, "Time": r.timestamp.strftime("%H:%M")} for r in res]), use_container_width=True)
-    except: pass
+        db = SessionLocal()
+        results = db.query(SPTable).order_by(SPTable.timestamp.desc()).all()
+        db.close()
+        if results:
+            data = [{
+                "ID": r.id,
+                "Supplier": r.supplier_name,
+                "Clinic": r.clinic_name,
+                "Date": r.invoice_date,
+                "Inv No": r.tax_invoice_number,
+                "Total": f"${r.total_amount}",
+                "Remarks": r.remarks
+            } for r in results]
+            st.dataframe(pd.DataFrame(data), use_container_width=True)
+        else: st.info("No SP records found.")
+    except Exception as e: st.error(str(e))
+
+    # FWL Table
+    st.markdown("### 🏢 FWL - Foreign Worker Levy (C68)")
+    try:
+        db = SessionLocal()
+        results = db.query(FWLTable).order_by(FWLTable.timestamp.desc()).all()
+        db.close()
+        if results:
+            data = [{
+                "ID": r.id,
+                "Clinic": r.clinic_name,
+                "Total": f"${r.total_payable}",
+                "Time": r.timestamp.strftime("%Y-%m-%d %H:%M:%S")
+            } for r in results]
+            st.dataframe(pd.DataFrame(data), use_container_width=True)
+        else: st.info("No FWL records found.")
+    except Exception as e: st.error(str(e))
+
+    st.divider()
+    st.markdown("### 🔍 Full Audit Trail")
+    try:
+        db = SessionLocal()
+        results = db.query(CellChange).order_by(CellChange.timestamp.desc()).limit(100).all()
+        db.close()
+        if results:
+            data = [{
+                "Table": r.source_table if r.source_table else "Manual",
+                "Record ID": r.source_id if r.source_id else "-",
+                "Cell": r.cell_reference,
+                "Label": r.label_name,
+                "Old": r.old_value,
+                "New": r.new_value,
+                "Time": r.timestamp.strftime("%Y-%m-%d %H:%M:%S")
+            } for r in results]
+            st.dataframe(pd.DataFrame(data), use_container_width=True)
+    except Exception as e: st.error(str(e))
