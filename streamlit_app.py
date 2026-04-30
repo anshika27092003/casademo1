@@ -368,8 +368,11 @@ with tab1:
                         inv_data, category = extract_invoice_data(extracted_text, uploaded_file.name)
                         
                         # Show Debug Info for ALL categories
-                        with st.expander(f"🔍 Debug: Extracted Data for {uploaded_file.name}", expanded=True):
+                        with st.expander(f"🔍 Debug: Parsed Data for {uploaded_file.name}", expanded=True):
                             st.json(inv_data)
+                        
+                        with st.expander(f"📄 Full Raw OCR Text for {uploaded_file.name}", expanded=False):
+                            st.text(extracted_text)
                         
                         if category == "SP":
                             # Safety check for float conversion
