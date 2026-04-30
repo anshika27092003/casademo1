@@ -10,15 +10,21 @@ Base = declarative_base()
 
 class CellChange(Base):
     __tablename__ = "cell_changes"
-
     id = Column(Integer, primary_key=True, index=True)
-    sheet_name = Column(String, index=True)
+    sheet_name = Column(String)
     cell_reference = Column(String)
     label_name = Column(String)
-    old_value = Column(String, nullable=True)
+    old_value = Column(String)
     new_value = Column(String)
-    source_table = Column(String, nullable=True) # CK, SP, FWL
-    source_id = Column(Integer, nullable=True)   # ID from the related table
+    source_table = Column(String, nullable=True) # "CK", "SP", "FWL"
+    source_id = Column(Integer, nullable=True)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+
+class SyncLock(Base):
+    """Table to prevent multiple workers from logging the same change."""
+    __tablename__ = "sync_locks"
+    id = Column(Integer, primary_key=True, index=True)
+    lock_key = Column(String, unique=True, index=True) # e.g. "C39_123.45_202404301201"
     timestamp = Column(DateTime, default=datetime.utcnow)
 
 class CKSecreterial(Base):
