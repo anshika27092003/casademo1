@@ -22,7 +22,7 @@ def log_to_ui(msg, type="info"):
     else: st.info(msg)
 
 # --- GOOGLE SHEETS SETUP ---
-SHEET_ID = "1Iq9jU8QvjF9V0_4_76Rk8V_P_T_P_T_P_T_P_T_P_T" # Placeholder
+SHEET_ID = "1FLeADEkmIJTJ-8E88lELpiJX1ARoK5D4tjSn2qcsU10" 
 SETTLEMENT_GID = 305885354
 LOCATION = "us"
 
@@ -37,42 +37,81 @@ def get_gsheet_client():
 def update_google_sheet(amount, category, filename, record_id=None):
     try:
         client = get_gsheet_client()
-        sheet = client.open_by_key(SHEET_ID).get_worksheet_by_id(SETTLEMENT_GID)
+        spreadsheet = client.open_by_key(SHEET_ID)
+        settlement = spreadsheet.get_worksheet_by_id(SETTLEMENT_GID)
         
         cell_map = {"CK": "C39", "SP": "C42", "FWL": "C68"}
         cell_ref = cell_map.get(category)
         
         if cell_ref:
-            # Atomic Lock to prevent duplicate logging of the sync we are about to do
-            db = SessionLocal()
-            minute_key = datetime.utcnow().strftime("%Y%m%d%H%M")
-            lock_key = f"{cell_ref}_{amount}_{minute_key}"
+            # Update the Shared Brain in the sheet so the tracker knows this was us
             try:
-                lock = SyncLock(lock_key=lock_key)
-                db.add(lock); db.commit()
-            except IntegrityError:
-                db.rollback(); db.close(); return # Already locked
+                sync_sheet = spreadsheet.worksheet("_SYNC_STATE_")
+                cell_list = sync_sheet.col_values(1)
+                row_idx = cell_list.index(cell_ref) + 1
+                sync_sheet.update_cell(row_idx, 2, str(amount))
+            except: pass 
             
             # Perform update
-            sheet.update_acell(cell_ref, amount)
-            
-            # Update Shared Memory so the tracker doesn't log this as a "manual change"
-            state = db.query(SheetState).filter(SheetState.cell_reference == cell_ref).first()
-            if state:
-                state.last_value = str(amount)
-                state.last_updated = datetime.utcnow()
-            else:
-                db.add(SheetState(cell_reference=cell_ref, last_value=str(amount)))
+            settlement.update_acell(cell_ref, amount)
             
             # Audit log
-            label_val = sheet.acell(f"A{cell_ref[1:]}").value
-            audit = CellChange(sheet_name="Settlement", cell_reference=cell_ref, label_name=str(label_val), old_value="OCR Sync", new_value=str(amount), source_table=category, source_id=record_id, timestamp=datetime.utcnow())
+            db = SessionLocal()
+            label_val = settlement.acell(f"A{cell_ref[1:]}").value
+            audit = CellChange(sheet_name="Settlement", cell_reference=cell_ref, label_name=str(label_val), old_value="OCR Upload", new_value=str(amount), source_table=category, source_id=record_id, timestamp=datetime.utcnow())
             db.add(audit); db.commit(); db.close()
             log_to_ui(f"✅ Synced {category} to {cell_ref} (${amount})", type="success")
     except Exception as e:
         log_to_ui(f"❌ Sheet Sync Error: {e}", type="error")
 
-# --- BACKGROUND TRACKER (Shared State) ---
+def save_to_db(filename, data, category):
+    db = SessionLocal()
+    try:
+        if category == "CK":
+            entry = CKSecreterial(
+                filename=filename,
+                supplier_name=data.get('supplier_name'),
+                invoice_date=data.get('invoice_date'),
+                invoice_no=data.get('invoice_no'),
+                bill_to=data.get('bill_to'),
+                total_amount=data.get('total_amount'),
+                remarks=data.get('remarks'),
+                timestamp=datetime.utcnow()
+            )
+        elif category == "SP":
+            entry = SPTable(
+                filename=filename,
+                supplier_name=data.get('supplier_name'),
+                clinic_name=data.get('bill_to'),
+                invoice_date=data.get('invoice_date'),
+                tax_invoice_number=data.get('invoice_no'),
+                sub_total=data.get('sub_total'),
+                gst_amount=data.get('gst_amount'),
+                total_amount=data.get('total_amount'),
+                remarks=data.get('remarks'),
+                timestamp=datetime.utcnow()
+            )
+        elif category == "FWL":
+            entry = FWLTable(
+                filename=filename,
+                clinic_name=data.get('bill_to'),
+                total_payable=data.get('total_amount'),
+                remarks=data.get('remarks'),
+                timestamp=datetime.utcnow()
+            )
+        
+        db.add(entry)
+        db.commit()
+        db.refresh(entry)
+        return entry.id
+    except Exception as e:
+        db.rollback()
+        logger.error(f"DB Save Error: {e}")
+        return None
+    finally:
+        db.close()
+
+# --- BACKGROUND TRACKER ---
 @st.cache_resource
 def get_tracker_manager():
     thread = threading.Thread(target=background_polling_loop, daemon=True)
@@ -83,36 +122,40 @@ def background_polling_loop():
     logger.info("Background tracker started.")
     while True:
         try:
-            db = SessionLocal()
-            sheet = get_gsheet_client().open_by_key(SHEET_ID).get_worksheet_by_id(SETTLEMENT_GID)
-            # Track C39, C42, C68
+            client = get_gsheet_client()
+            spreadsheet = client.open_by_key(SHEET_ID)
+            settlement = spreadsheet.get_worksheet_by_id(SETTLEMENT_GID)
+            
+            try:
+                sync_sheet = spreadsheet.worksheet("_SYNC_STATE_")
+            except gspread.WorksheetNotFound:
+                sync_sheet = spreadsheet.add_worksheet(title="_SYNC_STATE_", rows="100", cols="2")
+                sync_sheet.update("A1:B1", [["Cell", "LastValue"]])
+                sync_sheet.update("A2:B4", [["C39", "0"], ["C42", "0"], ["C68", "0"]])
+            
             cells = ["C39", "C42", "C68"]
+            sync_data = sync_sheet.get_all_records()
+            shared_memory = {str(r['Cell']): str(r['LastValue']).strip() for r in sync_data}
             
             for cell_ref in cells:
-                current_val = str(sheet.acell(cell_ref).value or "0").strip()
+                current_val = str(settlement.acell(cell_ref).value or "0").strip()
+                last_logged_val = shared_memory.get(cell_ref, "0")
                 
-                # Check Shared Memory in Database
-                state = db.query(SheetState).filter(SheetState.cell_reference == cell_ref).first()
-                if not state:
-                    state = SheetState(cell_reference=cell_ref, last_value=current_val)
-                    db.add(state); db.commit()
-                    continue
-                
-                if current_val != state.last_value:
-                    # WE FOUND A CHANGE!
-                    # 1. Atomic Lock (Double protection)
-                    lock_key = f"{cell_ref}_{current_val}_{datetime.utcnow().strftime('%Y%m%d%H%M')}"
+                if current_val != last_logged_val:
+                    # 1. Update Sheet Sync State FIRST (Locks other workers)
+                    cell_list = sync_sheet.col_values(1)
                     try:
-                        lock_entry = SyncLock(lock_key=lock_key)
-                        db.add(lock_entry); db.commit()
-                    except Exception:
-                        db.rollback(); continue
+                        row_idx = cell_list.index(cell_ref) + 1
+                        sync_sheet.update_cell(row_idx, 2, current_val)
+                    except ValueError:
+                        sync_sheet.append_row([cell_ref, current_val])
                     
-                    # 2. Log change in records
+                    # 2. Log to DB
+                    db = SessionLocal()
                     row_num = re.findall(r'\d+', cell_ref)[0]
-                    label_val = sheet.acell(f"A{row_num}").value
-                    source_table, source_id = None, None
+                    label_val = settlement.acell(f"A{row_num}").value
                     
+                    source_table, source_id = None, None
                     if cell_ref == "C39":
                         entry = CKSecreterial(filename="Manual Entry", total_amount=current_val, remarks="Manual edit in Sheet", timestamp=datetime.utcnow())
                         db.add(entry); db.flush(); source_table, source_id = "CK", entry.id
@@ -123,17 +166,11 @@ def background_polling_loop():
                         entry = FWLTable(filename="Manual Entry", total_payable=current_val, remarks="Manual edit in Sheet", timestamp=datetime.utcnow())
                         db.add(entry); db.flush(); source_table, source_id = "FWL", entry.id
                     
-                    # 3. Audit trail
-                    audit = CellChange(sheet_name="Settlement", cell_reference=cell_ref, label_name=str(label_val), old_value=state.last_value, new_value=current_val, source_table=source_table, source_id=source_id, timestamp=datetime.utcnow())
-                    db.add(audit)
+                    audit = CellChange(sheet_name="Settlement", cell_reference=cell_ref, label_name=str(label_val), old_value=last_logged_val, new_value=current_val, source_table=source_table, source_id=source_id, timestamp=datetime.utcnow())
+                    db.add(audit); db.commit(); db.close()
                     
-                    # 4. Update Shared Memory
-                    state.last_value = current_val
-                    state.last_updated = datetime.utcnow()
-                    db.commit()
-                    logger.info(f"Recorded manual change in {cell_ref}: {current_val}")
+                    logger.info(f"SUCCESS: Recorded manual change in {cell_ref} as {current_val}")
             
-            db.close()
             time.sleep(15) 
         except Exception as e:
             logger.error(f"Polling error: {e}")
@@ -142,17 +179,14 @@ def background_polling_loop():
 def start_background_tracker():
     get_tracker_manager()
 
-# --- OCR LOGIC ---
+# --- OCR ENGINE ---
 from google.cloud import documentai
-
-def get_processor_id():
-    return "7303c66f56860f77"
+def get_processor_id(): return "7303c66f56860f77"
 
 def extract_invoice_data(text, filename=""):
     data = {'total_amount': "Not Found", 'sub_total': "Not Found", 'gst_amount': "0.00", 'remarks': ""}
     category = "CK"
     
-    # 1. Determine Category
     if re.search(r"(?i)FWL|Foreign\s+Worker\s+Levy", text) or re.search(r"(?i)FWL", filename):
         category = "FWL"; data['supplier_name'] = "MOM (FWL)"
     elif re.search(r"(?i)Firmus\s+Cap", text) or re.search(r"(?i)SP|Firmus", filename):
@@ -160,11 +194,9 @@ def extract_invoice_data(text, filename=""):
     elif re.search(r"(?i)CK\s+SECRETARIAL", text) or re.search(r"(?i)CK", filename):
         category = "CK"; data['supplier_name'] = "CK SECRETARIAL SERVICES PTE LTD"
     
-    # 2. Extract Date
     date_match = re.search(r"(?i)(Date|Dated)\s*[:\s]*([\d\-\/]{6,}|[\d]{1,2}\s+[A-Za-z]{3}\s+[\d]{4})", text)
     data['invoice_date'] = date_match.group(2) if date_match else "Not Found"
     
-    # 3. Extract Invoice No
     inv_no_match = re.search(r"(?i)(Invoice|Tax\s+Invoice|Inv)\s+No\.\s*[:\s]*([A-Z0-9\-]+)", text)
     if inv_no_match:
         data['invoice_no'] = inv_no_match.group(2)
@@ -172,7 +204,6 @@ def extract_invoice_data(text, filename=""):
         inv_no_match = re.search(r"(?i)Invoice\s+([A-Z0-9\-]+)", text)
         data['invoice_no'] = inv_no_match.group(1) if inv_no_match else "Not Found"
     
-    # 4. Extract Clinic Name
     bill_to_match = re.search(r"(?i)(Bill\s+To|Delivered\s+To|Invoice\s+To|Sold\s+To)\s*[:\s]*([^\n,]+)", text)
     if bill_to_match:
         data['bill_to'] = bill_to_match.group(2).strip()
@@ -180,7 +211,6 @@ def extract_invoice_data(text, filename=""):
         known_search = re.search(r"(?i)(CASA\s+DENTAL\s+[\w\s]+(PTE\s+LTD)?)", text)
         data['bill_to'] = known_search.group(1).strip() if known_search else "Not Found"
     
-    # 5. Extract Amounts
     all_amounts = re.findall(r"[\d,]+\.\d{2}", text)
     lines = [l.strip() for l in text.split('\n') if l.strip()]
     for i, line in enumerate(lines):
@@ -192,7 +222,6 @@ def extract_invoice_data(text, filename=""):
     if data['total_amount'] == "Not Found" and all_amounts:
         data['total_amount'] = all_amounts[-1].replace(",", "")
     
-    # 6. Extract Remarks
     remarks_lines = []
     found_particulars = False
     for line in lines:
@@ -201,7 +230,6 @@ def extract_invoice_data(text, filename=""):
         if found_particulars and len(line) > 5: remarks_lines.append(line)
     data['remarks'] = " | ".join(remarks_lines) if remarks_lines else "Not Found"
     
-    # 7. --- FIRMUS CAP SPECIALIST ---
     if "Firmus" in str(data.get('supplier_name', '')) or "Firmus" in text or "SP" in filename:
         data['supplier_name'] = "FIRMUS CAP (BBCR) PTE LTD"
         m_clinic = re.search(r"(?i)CASA\s+DENTAL\s+\(?([^\)\n]+)\)?\s+PTE\s+LTD", text)
@@ -228,23 +256,17 @@ def process_document(file_content, mime_type):
         return client.process_document(request=request).document.text
     except Exception as e: log_to_ui(f"ERROR: {str(e)}", type="error"); return None
 
-# --- STREAMLIT UI ---
+# --- STREAMLIT PAGE ---
 st.set_page_config(page_title="Casa Dental Hub", page_icon="🦷", layout="wide")
 st.title("🦷 Casa Dental - Operations Hub")
 
-# Sidebar Maintenance
 with st.sidebar:
     st.header("⚙️ Maintenance")
-    if st.button("🧹 Clear All Records", type="secondary"):
-        try:
-            from database import engine, Base
-            Base.metadata.drop_all(bind=engine)
-            Base.metadata.create_all(bind=engine)
-            st.success("Database cleared!")
-            time.sleep(1)
-            st.rerun()
-        except Exception as e:
-            st.error(f"Error: {e}")
+    if st.button("清理数据库 (Clear All)", type="secondary"):
+        Base.metadata.drop_all(bind=engine)
+        Base.metadata.create_all(bind=engine)
+        st.success("Re-initialized!")
+        st.rerun()
 
 Base.metadata.create_all(bind=engine)
 start_background_tracker()
@@ -253,147 +275,63 @@ tab1, tab2 = st.tabs(["📤 Upload Documents (OCR)", "📋 View Records"])
 
 with tab1:
     st.subheader("🚀 Upload Invoices")
-    uploaded_files = st.file_uploader("Drop invoice images here (CK, SP, FWL)", type=['png', 'jpg', 'jpeg'], accept_multiple_files=True)
+    uploaded_files = st.file_uploader("Drop invoice images", type=['png', 'jpg', 'jpeg'], accept_multiple_files=True)
     
     if uploaded_files:
-        if st.button("✨ Process All Invoices"):
+        if st.button("✨ Process All"):
             sp_batch = []
             st.session_state['pending_fwl'] = []
-            
-            for uploaded_file in uploaded_files:
-                with st.status(f"🔍 Analyzing: {uploaded_file.name}") as status:
-                    file_bytes = uploaded_file.read()
-                    extracted_text = process_document(file_bytes, uploaded_file.type)
-                    if extracted_text:
-                        inv_data, category = extract_invoice_data(extracted_text, uploaded_file.name)
+            for f in uploaded_files:
+                with st.status(f"Processing {f.name}"):
+                    text = process_document(f.read(), f.type)
+                    if text:
+                        inv, cat = extract_invoice_data(text, f.name)
+                        st.json(inv)
+                        with st.expander("📄 Raw Text"): st.text(text)
                         
-                        with st.expander(f"🔍 Debug: Parsed Data for {uploaded_file.name}", expanded=True):
-                            st.json(inv_data)
-                        with st.expander(f"📄 Full Raw OCR Text for {uploaded_file.name}", expanded=False):
-                            st.text(extracted_text)
-                        
-                        if category == "SP":
-                            try:
-                                amt_float = float(str(inv_data['total_amount']).replace(",", ""))
-                                save_to_db(uploaded_file.name, inv_data, "SP")
-                                sp_batch.append(amt_float)
-                                status.update(label=f"Added to SP Batch: ${amt_float}", state="complete")
-                            except: status.update(label=f"Could not read amount", state="error")
-                        elif category == "FWL":
-                            st.session_state['pending_fwl'].append({"filename": uploaded_file.name, "data": inv_data})
-                            status.update(label=f"Pending Clinic Pickup", state="complete")
+                        if cat == "SP":
+                            save_to_db(f.name, inv, "SP")
+                            sp_batch.append(float(str(inv['total_amount']).replace(",", "")))
+                        elif cat == "FWL":
+                            st.session_state['pending_fwl'].append({"filename": f.name, "data": inv})
                         else:
-                            rid = save_to_db(uploaded_file.name, inv_data, category)
-                            update_google_sheet(inv_data['total_amount'], category, uploaded_file.name, rid)
-                            status.update(label=f"Synced: {uploaded_file.name}", state="complete")
-            
+                            rid = save_to_db(f.name, inv, cat)
+                            update_google_sheet(inv['total_amount'], cat, f.name, rid)
+
             if sp_batch:
-                st.session_state['sp_batch_total'] = sum(sp_batch)
-                st.session_state['sp_batch_count'] = len(sp_batch)
+                st.session_state['sp_total'] = sum(sp_batch)
+                st.session_state['sp_count'] = len(sp_batch)
 
         if st.session_state.get('pending_fwl'):
-            st.divider(); st.subheader("🏥 Pending FWL Confirmation")
             for i, item in enumerate(st.session_state['pending_fwl']):
-                col1, col2, col3 = st.columns([2, 2, 1])
-                with col1: st.write(f"📄 {item['filename']} (**${item['data']['total_amount']}**)")
-                with col2: 
-                    clinic = st.selectbox(f"Assign Clinic for {item['filename']}", ["ADMIRALTY", "AMK", "BATOK", "CLEMENTI", "HOLLAND", "JURONG", "KAMPUNG", "TAMPINES"], key=f"fwl_{i}")
-                with col3:
-                    if st.button(f"Sync FWL #{i+1}"):
-                        item['data']['bill_to'] = f"CASA DENTAL {clinic} PTE LTD"
-                        rid = save_to_db(item['filename'], item['data'], "FWL")
-                        update_google_sheet(item['data']['total_amount'], "FWL", item['filename'], rid)
-                        st.session_state['pending_fwl'].pop(i); st.rerun()
+                clinic = st.selectbox(f"Clinic for {item['filename']}", ["ADMIRALTY", "AMK", "BATOK", "CLEMENTI", "HOLLAND", "JURONG", "KAMPUNG", "TAMPINES"], key=f"fwl_{i}")
+                if st.button(f"Sync {item['filename']}"):
+                    item['data']['bill_to'] = clinic
+                    rid = save_to_db(item['filename'], item['data'], "FWL")
+                    update_google_sheet(item['data']['total_amount'], "FWL", item['filename'], rid)
+                    st.session_state['pending_fwl'].pop(i); st.rerun()
 
-        if 'sp_batch_total' in st.session_state:
-            st.divider(); st.subheader("📊 SP Batch Ready")
-            st.info(f"Total Sum: **${st.session_state['sp_batch_total']:.2f}** ({st.session_state['sp_batch_count']} files)")
-            if st.button("🚀 Sync SP Total to C42"):
-                update_google_sheet(f"{st.session_state['sp_batch_total']:.2f}", "SP", "Batch Update")
-                del st.session_state['sp_batch_total']; st.balloons()
+        if 'sp_total' in st.session_state:
+            st.success(f"Batch Total: ${st.session_state['sp_total']:.2f}")
+            if st.button("Confirm SP Sync"):
+                update_google_sheet(f"{st.session_state['sp_total']:.2f}", "SP", "Batch")
+                del st.session_state['sp_total']; st.rerun()
 
 with tab2:
-    st.subheader("📊 Audit Trail & Records")
+    st.subheader("📋 Audit Trail")
+    def show(title, model, map_fn):
+        st.write(f"### {title}")
+        db = SessionLocal()
+        rows = db.query(model).order_by(model.timestamp.desc()).all()
+        db.close()
+        if rows: st.dataframe(pd.DataFrame([map_fn(r) for r in rows]), use_container_width=True)
+
+    show("CK", CKSecreterial, lambda r: {"File": r.filename, "Date": r.invoice_date, "Amt": r.total_amount, "Time": r.timestamp.strftime("%H:%M")})
+    show("SP", SPTable, lambda r: {"File": r.filename, "Clinic": r.clinic_name, "Amt": r.total_amount})
+    show("FWL", FWLTable, lambda r: {"File": r.filename, "Clinic": r.clinic_name, "Amt": r.total_payable})
     
-    # CK Table
-    st.markdown("### 📝 CK Secreterial (C39)")
-    try:
-        db = SessionLocal()
-        results = db.query(CKSecreterial).order_by(CKSecreterial.timestamp.desc()).all()
-        db.close()
-        if results:
-            data = [{
-                "ID": r.id,
-                "Filename": r.filename,
-                "Supplier": r.supplier_name,
-                "Consignment No": r.consignment_number,
-                "Invoice Date": r.invoice_date,
-                "Invoice No": r.invoice_no,
-                "Bill To": r.bill_to,
-                "Sub Total": f"${r.sub_total}" if r.sub_total else "N/A",
-                "GST Amount": f"${r.gst_amount}" if r.gst_amount else "N/A",
-                "Total Amount": f"${r.total_amount}",
-                "Remarks": r.remarks
-            } for r in results]
-            st.dataframe(pd.DataFrame(data), use_container_width=True)
-        else: st.info("No CK records found.")
-    except Exception as e: st.error(str(e))
-
-    # SP Table
-    st.markdown("### ⚡ SP - Firmus Cap (C42)")
-    try:
-        db = SessionLocal()
-        results = db.query(SPTable).order_by(SPTable.timestamp.desc()).all()
-        db.close()
-        if results:
-            data = [{
-                "ID": r.id,
-                "Supplier": r.supplier_name,
-                "Clinic": r.clinic_name,
-                "Date": r.invoice_date,
-                "Inv No": r.tax_invoice_number,
-                "Sub Total": f"${r.sub_total}" if r.sub_total else "N/A",
-                "GST": f"${r.gst_amount}" if r.gst_amount else "N/A",
-                "Total": f"${r.total_amount}",
-                "Remarks": r.remarks
-            } for r in results]
-            st.dataframe(pd.DataFrame(data), use_container_width=True)
-        else: st.info("No SP records found.")
-    except Exception as e: st.error(str(e))
-
-    # FWL Table
-    st.markdown("### 🏢 FWL - Foreign Worker Levy (C68)")
-    try:
-        db = SessionLocal()
-        results = db.query(FWLTable).order_by(FWLTable.timestamp.desc()).all()
-        db.close()
-        if results:
-            data = [{
-                "ID": r.id,
-                "Clinic": r.clinic_name,
-                "Total": f"${r.total_payable}",
-                "Time": r.timestamp.strftime("%Y-%m-%d %H:%M:%S")
-            } for r in results]
-            st.dataframe(pd.DataFrame(data), use_container_width=True)
-        else: st.info("No FWL records found.")
-    except Exception as e: st.error(str(e))
-
-    # Full Audit Trail
-    st.divider(); st.markdown("### 🔍 Full Audit Trail")
-    try:
-        db = SessionLocal()
-        logs = db.query(CellChange).order_by(CellChange.timestamp.desc()).all()
-        db.close()
-        if logs:
-            audit_data = [{
-                "Table": l.source_table or "Manual",
-                "Record ID": l.source_id or "-",
-                "Cell": l.cell_reference,
-                "Label": l.label_name,
-                "Old": l.old_value,
-                "New": l.new_value,
-                "Time": l.timestamp.strftime("%Y-%m-%d %H:%M:%S")
-            } for l in logs]
-            st.dataframe(pd.DataFrame(audit_data), use_container_width=True)
-        else: st.info("No audit logs yet.")
-    except Exception as e: st.error(str(e))
+    st.write("### 🔍 System Logs")
+    db = SessionLocal()
+    logs = db.query(CellChange).order_by(CellChange.timestamp.desc()).all()
+    db.close()
+    if logs: st.dataframe(pd.DataFrame([{"Cell": l.cell_reference, "Old": l.old_value, "New": l.new_value, "Time": l.timestamp.strftime("%H:%M:%S")} for l in logs]), use_container_width=True)
