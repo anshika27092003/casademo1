@@ -111,9 +111,18 @@ def background_polling_loop():
                 new_val = new_state.get(cell_ref)
                 old_val = last_state.get(cell_ref)
                 
-                # Only log if value actually changed and we have both values
+            for cell_ref in ["C39", "C42", "C68"]:
+                new_val = new_state.get(cell_ref)
+                old_val = last_state.get(cell_ref)
+                
                 if old_val and new_val and str(new_val) != str(old_val):
-                    # --- ANTI-DUPLICATE CHECK ---
+                    # --- DISTRIBUTED JITTER ---
+                    import random
+                    time.sleep(random.uniform(0.1, 2.0)) # Random jitter to break ties
+                    
+                    # --- RE-FETCH DB TO SEE OTHER THREADS ---
+                    db.expire_all() 
+                    
                     is_duplicate = False
                     if cell_ref == "C39":
                         dup = db.query(CKSecreterial).filter(CKSecreterial.total_amount == str(new_val), CKSecreterial.filename == "Manual Entry").order_by(CKSecreterial.timestamp.desc()).first()
@@ -122,11 +131,12 @@ def background_polling_loop():
                     elif cell_ref == "C68":
                         dup = db.query(FWLTable).filter(FWLTable.total_payable == str(new_val), FWLTable.filename == "Manual Entry").order_by(FWLTable.timestamp.desc()).first()
                     
-                    if dup and (datetime.utcnow() - dup.timestamp).total_seconds() < 45:
+                    # If any entry exists in the last 60s, it's a duplicate
+                    if dup and (datetime.utcnow() - dup.timestamp).total_seconds() < 60:
                         is_duplicate = True
                     
                     if is_duplicate:
-                        logger.info(f"Skipping duplicate log for {cell_ref}: {new_val}")
+                        logger.info(f"Race Condition Blocked: Duplicate found for {cell_ref}")
                         continue
 
                     # --- PROCEED WITH LOGGING ---
@@ -145,8 +155,9 @@ def background_polling_loop():
                         db.add(entry); db.flush(); source_table, source_id = "FWL", entry.id
                     
                     audit = CellChange(sheet_name="Settlement Sheet", cell_reference=cell_ref, label_name=str(label_val), old_value=str(old_val), new_value=str(new_val), source_table=source_table, source_id=source_id, timestamp=datetime.utcnow())
-                    db.add(audit); changes_found = True
-                    logger.info(f"Detected change in {cell_ref}: {old_val} -> {new_val}")
+                    db.add(audit); db.commit() # Commit immediately to "lock" it for others
+                    logger.info(f"Recorded manual change in {cell_ref}: {new_val}")
+                    changes_found = True
             
             if changes_found: db.commit()
             db.close()
