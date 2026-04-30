@@ -364,6 +364,10 @@ with tab1:
                     if extracted_text:
                         inv_data, category = extract_invoice_data(extracted_text, uploaded_file.name)
                         if category == "SP":
+                            # Show Debug Info
+                            with st.expander(f"🔍 Debug: Extracted Data for {uploaded_file.name}", expanded=True):
+                                st.json(inv_data)
+                            
                             # Safety check for float conversion
                             try:
                                 amt_str = str(inv_data['total_amount']).replace(",", "")
