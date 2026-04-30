@@ -27,6 +27,13 @@ class SyncLock(Base):
     lock_key = Column(String, unique=True, index=True) # e.g. "C39_123.45_202404301201"
     timestamp = Column(DateTime, default=datetime.utcnow)
 
+class SheetState(Base):
+    """Table to keep track of the last processed value of each cell globally."""
+    __tablename__ = "sheet_state"
+    cell_reference = Column(String, primary_key=True)
+    last_value = Column(String)
+    last_updated = Column(DateTime, default=datetime.utcnow)
+
 class CKSecreterial(Base):
     __tablename__ = "ck_secreterial"
 
