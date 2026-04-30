@@ -51,8 +51,6 @@ def log_to_ui(message, type="info"):
     elif type == "warning": st.warning(message)
 
 # --- TRACKER LOGIC ---
-_tracker_thread = None
-
 def get_column_letter(n):
     string = ""
     while n > 0:
@@ -77,32 +75,47 @@ def load_google_sheet_state(url):
     except Exception as e: logger.error(f"Error loading Google Sheet: {e}")
     return {}
 
-def start_background_tracker():
-    """Starts a single global background tracker thread."""
-    global _tracker_thread
-    if _tracker_thread is None or not _tracker_thread.is_alive():
-        _tracker_thread = threading.Thread(target=background_polling_loop, daemon=True)
-        _tracker_thread.start()
-        logger.info("Global background tracker started.")
+@st.cache_resource
+def get_tracker_manager():
+    """Creates a singleton manager to ensure only one tracker thread runs globally."""
+    class TrackerManager:
+        def __init__(self):
+            self.thread = None
+            self.running = False
+
+        def start(self):
+            if not self.running:
+                self.running = True
+                self.thread = threading.Thread(target=background_polling_loop, daemon=True)
+                self.thread.start()
+                logger.info("Master Singleton Tracker started.")
+
+    manager = TrackerManager()
+    manager.start()
+    return manager
 
 def background_polling_loop():
+    # Load initial state
     last_state = load_google_sheet_state(GOOGLE_SHEET_CSV_URL)
     while True:
         try:
-            time.sleep(10)
+            time.sleep(15) # Poll every 15s for stability
             new_state = load_google_sheet_state(GOOGLE_SHEET_CSV_URL)
             if not new_state: continue
             
             db = SessionLocal()
             changes_found = False
             
+            # Identify monitored cells
             for cell_ref in ["C39", "C42", "C68"]:
                 new_val = new_state.get(cell_ref)
                 old_val = last_state.get(cell_ref)
                 
-                if new_val and new_val != old_val:
+                # Only log if value actually changed and we have both values
+                if old_val and new_val and new_val != old_val:
                     row_num = re.findall(r'\d+', cell_ref)[0]
                     label_val = new_state.get(f"A{row_num}", "Manual Update")
+                    
                     source_table, source_id = None, None
                     if cell_ref == "C39":
                         entry = CKSecreterial(filename="Manual Entry", total_amount=str(new_val), remarks="Manual edit in Sheet", timestamp=datetime.utcnow())
@@ -116,12 +129,19 @@ def background_polling_loop():
                     
                     audit = CellChange(sheet_name="Settlement Sheet", cell_reference=cell_ref, label_name=str(label_val), old_value=str(old_val), new_value=str(new_val), source_table=source_table, source_id=source_id, timestamp=datetime.utcnow())
                     db.add(audit); changes_found = True
+                    logger.info(f"Detected change in {cell_ref}: {old_val} -> {new_val}")
             
             if changes_found: db.commit()
-            db.close(); last_state = new_state
+            db.close()
+            last_state = new_state # Update memory AFTER processing
         except Exception as e:
             logger.error(f"Polling error: {e}")
-            time.sleep(5)
+            time.sleep(10)
+
+def start_background_tracker():
+    # This now just triggers the cached resource
+    get_tracker_manager()
+
 
 # --- DATABASE LOGIC ---
 def save_to_db(filename, data, category):
