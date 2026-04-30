@@ -288,25 +288,30 @@ def extract_invoice_data(text, filename=""):
     data['remarks'] = " | ".join(remarks_lines) if remarks_lines else "Not Found"
     
     # 7. --- FIRMUS CAP SPECIALIST BLOCK ---
-    if "Firmus" in data.get('supplier_name', ''):
-        # Invoice No: Tax Invoice No : [VALUE]
-        m_no = re.search(r"(?i)Tax\s+Invoice\s+No\s*:\s*([A-Z0-9]+)", text)
-        if m_no: data['invoice_no'] = m_no.group(1)
+    if "Firmus" in str(data.get('supplier_name', '')) or "Firmus" in text or "SP" in filename:
+        # Better Clinic Match (Look for CASA DENTAL in a more robust way)
+        m_clinic = re.search(r"(?i)CASA\s+DENTAL\s+[\w\s\(\)]+PTE\s+LTD", text)
+        if m_clinic: data['bill_to'] = m_clinic.group(0).strip()
         
-        # Date: Tax Invoice Date : [VALUE]
-        m_date = re.search(r"(?i)Tax\s+Invoice\s+Date\s*:\s*([\d\/]+)", text)
-        if m_date: data['invoice_date'] = m_date.group(1)
+        # Invoice No: Look for anything after "No :"
+        m_no = re.search(r"(?i)(Invoice|Inv)\s+No\s*:\s*([^\s\n]+)", text)
+        if m_no: data['invoice_no'] = m_no.group(2).strip()
         
-        # Clinic: Look for CASA DENTAL (...) PTE LTD
-        m_clinic = re.search(r"(?i)(CASA\s+DENTAL\s+\([^\)]+\)\s+PTE\s+LTD)", text)
-        if m_clinic: data['bill_to'] = m_clinic.group(1)
+        # Date: Look for anything after "Date :"
+        m_date = re.search(r"(?i)Date\s*:\s*([\d\-\/]{8,})", text)
+        if m_date: data['invoice_date'] = m_date.group(1).strip()
         
-        # Amounts: Sub Total : [VALUE] / Grand Total : [VALUE]
-        m_sub = re.search(r"(?i)Sub\s+Total\s*:\s*([\d,]+\.\d{2})", text)
-        if m_sub: data['sub_total'] = m_sub.group(1).replace(",", "")
-        
-        m_total = re.search(r"(?i)Grand\s+Total\s*:\s*([\d,]+\.\d{2})", text)
-        if m_total: data['total_amount'] = m_total.group(1).replace(",", "")
+        # Financials: Look for keywords and then the first money-like string on that line or next
+        for line in lines:
+            if re.search(r"(?i)Sub\s*Total", line):
+                amt = re.search(r"[\d,]+\.\d{2}", line)
+                if amt: data['sub_total'] = amt.group(0).replace(",", "")
+            if re.search(r"(?i)Grand\s*Total", line):
+                amt = re.search(r"[\d,]+\.\d{2}", line)
+                if amt: data['total_amount'] = amt.group(0).replace(",", "")
+            if re.search(r"(?i)GST\s*@", line) or re.search(r"(?i)GST\s*9%", line):
+                amt = re.search(r"[\d,]+\.\d{2}", line)
+                if amt: data['gst_amount'] = amt.group(0).replace(",", "")
 
     return data, category
 
