@@ -423,6 +423,8 @@ with tab2:
                 "Clinic": r.clinic_name,
                 "Date": r.invoice_date,
                 "Inv No": r.tax_invoice_number,
+                "Sub Total": f"${r.sub_total}" if r.sub_total else "N/A",
+                "GST": f"${r.gst_amount}" if r.gst_amount else "N/A",
                 "Total": f"${r.total_amount}",
                 "Remarks": r.remarks
             } for r in results]
