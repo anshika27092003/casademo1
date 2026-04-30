@@ -273,6 +273,20 @@ def process_document(file_content, mime_type):
 st.set_page_config(page_title="Casa Dental Hub", page_icon="🦷", layout="wide")
 st.title("🦷 Casa Dental - Operations Hub")
 
+# Sidebar Maintenance
+with st.sidebar:
+    st.header("⚙️ Maintenance")
+    if st.button("🧹 Clear All Records", type="secondary"):
+        try:
+            from database import engine, Base
+            Base.metadata.drop_all(bind=engine)
+            Base.metadata.create_all(bind=engine)
+            st.success("Database cleared!")
+            time.sleep(1)
+            st.rerun()
+        except Exception as e:
+            st.error(f"Error: {e}")
+
 Base.metadata.create_all(bind=engine)
 start_background_tracker()
 
