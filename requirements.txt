@@ -1,6 +1,11 @@
 streamlit
 google-cloud-documentai
 google-auth
-pandas
 gspread
+pandas
 sqlalchemy
+requests
+uvicorn
+fastapi
+python-multipart
+psycopg2-binary

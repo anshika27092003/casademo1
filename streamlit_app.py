@@ -1,17 +1,47 @@
-import streamlit as st
-from google.cloud import documentai_v1 as documentai
-from google.oauth2 import service_account
-import json
+import requests
+import csv
+import time
 import logging
+import threading
+import json
 import re
 import pandas as pd
 import gspread
 from io import BytesIO
 from datetime import datetime
+import streamlit as st
+from google.cloud import documentai_v1 as documentai
+from google.oauth2 import service_account
+from database import SessionLocal, CKSecreterial, SPTable, FWLTable, CellChange, Base, engine
 
 # --- LOGGING SETUP ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# --- CONFIGURATION ---
+LOCATION = "us" 
+SPREADSHEET_ID = "1FLeADEkmIJTJ-8E88lELpiJX1ARoK5D4tjSn2qcsU10"
+GOOGLE_SHEET_CSV_URL = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/export?format=csv&gid=305885354"
+
+CLINICS = [
+    "CASA DENTAL AMK PTE LTD", "CASA DENTAL CLEMENTI PTE LTD",
+    "CASA DENTAL HOLLAND PTE LTD", "CASA DENTAL ADM PTE LTD",
+    "CASA DENTAL BB PTE LTD", "CASA DENTAL WDLS PTE LTD"
+]
+
+def get_credentials():
+    """Fetches GCP credentials from Streamlit secrets (cloud) or local file (dev)."""
+    if "gcp_service_account" in st.secrets:
+        return service_account.Credentials.from_service_account_info(dict(st.secrets["gcp_service_account"]))
+    else:
+        return service_account.Credentials.from_service_account_file("credentials.json")
+
+def get_processor_id():
+    """Fetches Document AI Processor ID from secrets or local file."""
+    if "gcp_service_account" in st.secrets:
+        return st.secrets["gcp_service_account"]["processor_id"]
+    else:
+        with open("credentials.json", "r") as f: return json.load(f)["processor_id"]
 
 def log_to_ui(message, type="info"):
     logger.info(message)
@@ -20,153 +50,238 @@ def log_to_ui(message, type="info"):
     elif type == "error": st.error(message)
     elif type == "warning": st.warning(message)
 
-# --- CONFIGURATION (CLOUD READY) ---
-LOCATION = "us" 
-SPREADSHEET_ID = "1FLeADEkmIJTJ-8E88lELpiJX1ARoK5D4tjSn2qcsU10"
+# --- TRACKER LOGIC ---
+_tracker_thread = None
 
-# Helper to get credentials from Secrets (Cloud) or File (Local)
-def get_credentials():
-    if "gcp_service_account" in st.secrets:
-        return dict(st.secrets["gcp_service_account"])
-    else:
-        with open("credentials.json", "r") as f:
-            return json.load(f)
+def get_column_letter(n):
+    string = ""
+    while n > 0:
+        n, remainder = divmod(n - 1, 26)
+        string = chr(65 + remainder) + string
+    return string
 
-# --- GOOGLE SHEETS "DATABASE" LOGIC ---
-def get_gsheet_client():
-    creds_data = get_credentials()
-    return gspread.service_account_from_dict(creds_data)
-
-def save_to_gsheet(data):
-    """Saves extracted data to a 'OCR_RECORDS' tab in the Google Sheet."""
+def load_google_sheet_state(url):
     try:
-        gc = get_gsheet_client()
-        sh = gc.open_by_key(SPREADSHEET_ID)
-        
-        # Try to find or create the OCR_RECORDS worksheet
+        response = requests.get(url)
+        if response.status_code == 200:
+            content = response.content.decode('utf-8')
+            csv_reader = csv.reader(content.splitlines())
+            rows = list(csv_reader)
+            sheet_data = {}
+            for r_idx, row in enumerate(rows):
+                for c_idx, val in enumerate(row):
+                    if val.strip():
+                        cell_ref = f"{get_column_letter(c_idx+1)}{r_idx+1}"
+                        sheet_data[cell_ref] = val.strip()
+            return sheet_data
+    except Exception as e: logger.error(f"Error loading Google Sheet: {e}")
+    return {}
+
+def start_background_tracker():
+    """Starts a single global background tracker thread."""
+    global _tracker_thread
+    if _tracker_thread is None or not _tracker_thread.is_alive():
+        _tracker_thread = threading.Thread(target=background_polling_loop, daemon=True)
+        _tracker_thread.start()
+        logger.info("Global background tracker started.")
+
+def background_polling_loop():
+    last_state = load_google_sheet_state(GOOGLE_SHEET_CSV_URL)
+    while True:
         try:
-            worksheet = sh.worksheet("OCR_RECORDS")
-        except gspread.exceptions.WorksheetNotFound:
-            worksheet = sh.add_worksheet(title="OCR_RECORDS", rows="100", cols="20")
-            worksheet.append_row([
-                "Timestamp", "Filename", "Supplier", "Reg No", "Date", 
-                "Inv No", "Bill To", "Sub Total", "GST", "Total", "Remarks"
-            ])
-        
-        row = [
-            datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-            data.get('filename'),
-            data.get('supplier_name'),
-            data.get('consignment_number'),
-            data.get('invoice_date'),
-            data.get('invoice_no'),
-            data.get('bill_to'),
-            data.get('sub_total'),
-            data.get('gst_amount'),
-            data.get('total_amount'),
-            data.get('remarks')
-        ]
-        worksheet.append_row(row)
-        log_to_ui(f"Saved entry to Google Sheet 'OCR_RECORDS' tab!", type="success")
-    except Exception as e:
-        log_to_ui(f"Failed to save to Google Sheet: {str(e)}", type="error")
+            time.sleep(10)
+            new_state = load_google_sheet_state(GOOGLE_SHEET_CSV_URL)
+            if not new_state: continue
+            
+            db = SessionLocal()
+            changes_found = False
+            
+            for cell_ref in ["C39", "C42", "C68"]:
+                new_val = new_state.get(cell_ref)
+                old_val = last_state.get(cell_ref)
+                
+                if new_val and new_val != old_val:
+                    row_num = re.findall(r'\d+', cell_ref)[0]
+                    label_val = new_state.get(f"A{row_num}", "Manual Update")
+                    source_table, source_id = None, None
+                    if cell_ref == "C39":
+                        entry = CKSecreterial(filename="Manual Entry", total_amount=str(new_val), remarks="Manual edit in Sheet", timestamp=datetime.utcnow())
+                        db.add(entry); db.flush(); source_table, source_id = "CK", entry.id
+                    elif cell_ref == "C42":
+                        entry = SPTable(filename="Manual Entry", total_amount=str(new_val), remarks="Manual edit in Sheet", timestamp=datetime.utcnow())
+                        db.add(entry); db.flush(); source_table, source_id = "SP", entry.id
+                    elif cell_ref == "C68":
+                        entry = FWLTable(filename="Manual Entry", total_payable=str(new_val), remarks="Manual edit in Sheet", timestamp=datetime.utcnow())
+                        db.add(entry); db.flush(); source_table, source_id = "FWL", entry.id
+                    
+                    audit = CellChange(sheet_name="Settlement Sheet", cell_reference=cell_ref, label_name=str(label_val), old_value=str(old_val), new_value=str(new_val), source_table=source_table, source_id=source_id, timestamp=datetime.utcnow())
+                    db.add(audit); changes_found = True
+            
+            if changes_found: db.commit()
+            db.close(); last_state = new_state
+        except Exception as e:
+            logger.error(f"Polling error: {e}")
+            time.sleep(5)
 
-def update_settlement_cell(amount):
-    """Updates cell C39 in the main settlement tab."""
+# --- DATABASE LOGIC ---
+def save_to_db(filename, data, category):
     try:
-        gc = get_gsheet_client()
-        sh = gc.open_by_key(SPREADSHEET_ID)
-        worksheet = sh.get_worksheet(0) # Main tab
-        worksheet.update_acell('C39', amount)
-        log_to_ui(f"Updated Settlement Cell C39 with ${amount}!", type="success")
-    except Exception as e:
-        log_to_ui(f"Failed to update Cell C39: {str(e)}", type="error")
+        db = SessionLocal()
+        if category == "CK":
+            new_entry = CKSecreterial(filename=filename, supplier_name=data.get('supplier_name'), consignment_number=data.get('consignment_number'), invoice_date=data.get('invoice_date'), invoice_no=data.get('invoice_no'), bill_to=data.get('bill_to'), sub_total=data.get('sub_total'), gst_amount=data.get('gst_amount'), total_amount=str(data.get('total_amount')), remarks=data.get('remarks'), timestamp=datetime.utcnow())
+        elif category == "SP":
+            new_entry = SPTable(filename=filename, supplier_name=data.get('supplier_name', "Firmus Cap"), clinic_name=data.get('bill_to'), invoice_date=data.get('invoice_date'), tax_invoice_number=data.get('invoice_no'), sub_total=data.get('sub_total'), gst_amount=data.get('gst_amount'), total_amount=str(data.get('total_amount')), remarks=data.get('remarks'), timestamp=datetime.utcnow())
+        elif category == "FWL":
+            new_entry = FWLTable(filename=filename, clinic_name=data.get('bill_to'), total_payable=str(data.get('total_amount')), remarks=data.get('remarks'), timestamp=datetime.utcnow())
+        db.add(new_entry); db.commit(); db.refresh(new_entry); rid = new_entry.id; db.close(); return rid
+    except Exception as e: log_to_ui(f"DB Error: {str(e)}", type="error"); return None
 
-# --- EXTRACTION ENGINE ---
-def extract_invoice_data(text):
+def update_google_sheet(amount, category, filename, record_id=None):
+    try:
+        mapping = {"CK": "C39", "SP": "C42", "FWL": "C68"}
+        labels = {"CK": "CK Secreterial", "SP": "SP (Firmus Cap)", "FWL": "Foreign Worker Levy"}
+        cell, label = mapping.get(category, "C39"), labels.get(category, "Item")
+        creds = get_credentials()
+        gc = gspread.authorize(creds)
+        sh = gc.open_by_key(SPREADSHEET_ID); worksheet = sh.get_worksheet(0) 
+        old_val = worksheet.acell(cell).value
+        worksheet.update_acell(cell, amount)
+        db = SessionLocal()
+        audit_entry = CellChange(sheet_name="Settlement Sheet", cell_reference=cell, label_name=f"{label} (via OCR Batch)" if "Batch" in filename else f"{label} (via OCR: {filename})", old_value=str(old_val), new_value=str(amount), source_table=category, source_id=record_id, timestamp=datetime.utcnow())
+        db.add(audit_entry); db.commit(); db.close()
+        log_to_ui(f"Updated {cell} with {amount}!", type="success")
+    except Exception as e: log_to_ui(f"Sync Error: {str(e)}", type="error")
+
+# --- EXTRACTION & OCR ---
+def extract_invoice_data(text, filename=""):
     data = {'total_amount': "Not Found", 'sub_total': "Not Found", 'gst_amount': "0.00", 'remarks': ""}
-    if re.search(r"(?i)CK\s+SECRETARIAL\s+SERVICES", text): data['supplier_name'] = "CK SECRETARIAL SERVICES PTE LTD"
-    reg_match = re.search(r"(?i)Registration\s+Number\s*[:\s]*([\w]+)", text)
-    data['consignment_number'] = reg_match.group(1) if reg_match else "Not Found"
+    category = "CK"
+    if re.search(r"(?i)FWL|Foreign\s+Worker\s+Levy", text) or re.search(r"(?i)FWL", filename):
+        category = "FWL"; data['supplier_name'] = "MOM (FWL)"
+    elif re.search(r"(?i)Firmus\s+Cap", text) or re.search(r"(?i)SP|Firmus", filename):
+        category = "SP"; data['supplier_name'] = "Firmus Cap"
+    elif re.search(r"(?i)CK\s+SECRETARIAL", text) or re.search(r"(?i)CK", filename):
+        category = "CK"; data['supplier_name'] = "CK SECRETARIAL SERVICES PTE LTD"
+    
     date_match = re.search(r"(?i)Date\s*[:\s]*([\d/]{6,})", text)
     data['invoice_date'] = date_match.group(1) if date_match else "Not Found"
-    inv_no_match = re.search(r"(?i)Invoice\s+No\.\s*[:\s]*([\d]+)", text)
-    data['invoice_no'] = inv_no_match.group(1) if inv_no_match else "Not Found"
-    bill_to_match = re.search(r"(?i)INVOICE\s*\n\s*([\w\s]+PTE\s+LTD)", text)
-    data['bill_to'] = bill_to_match.group(1).strip() if bill_to_match else "Not Found"
+    inv_no_match = re.search(r"(?i)(Invoice|Tax\s+Invoice)\s+No\.\s*[:\s]*([\d]+)", text)
+    data['invoice_no'] = inv_no_match.group(2) if inv_no_match else "Not Found"
+    bill_to_match = re.search(r"(?i)(INVOICE|Bill\s+To|Delivered\s+To|Clinic\s+Name)\s*[:\s]*([\w\s]+PTE\s+LTD)", text)
+    if not bill_to_match: bill_to_match = re.search(r"(?i)(CASA\s+DENTAL\s+[\w\s]+PTE\s+LTD)", text)
+    data['bill_to'] = bill_to_match.group(2).strip() if bill_to_match and len(bill_to_match.groups()) > 1 else (bill_to_match.group(1).strip() if bill_to_match else "Not Found")
     
+    all_amounts = re.findall(r"[\d,]+\.\d{2}", text)
     lines = [l.strip() for l in text.split('\n') if l.strip()]
     for i, line in enumerate(lines):
-        if re.search(r"(?i)\bTotal\b", line) and not re.search(r"(?i)sub", line):
+        if re.search(r"(?i)\b(Total|Grand\s*Total|Total\s*Payable)\b", line) and not re.search(r"(?i)sub", line):
             amt = re.search(r"\$?\s*([\d,]+\.\d{2})", line)
             if not amt and i+1 < len(lines): amt = re.search(r"^\$?\s*([\d,]+\.\d{2})", lines[i+1])
             if amt: data['total_amount'] = amt.group(1).replace(",", "")
-        if re.search(r"(?i)Sub\s+Total", line):
-            amt = re.search(r"\$?\s*([\d,]+\.\d{2})", line)
-            if amt: data['sub_total'] = amt.group(1).replace(",", "")
-        if re.search(r"(?i)GST", line):
-            amt = re.search(r"\$?\s*([\d,]+\.\d{2})", line)
-            if amt: data['gst_amount'] = amt.group(1).replace(",", "")
-
+    if data['total_amount'] == "Not Found" and all_amounts: data['total_amount'] = all_amounts[-1].replace(",", "")
+    
     remarks_lines = []
     found_particulars = False
     for line in lines:
-        if re.search(r"(?i)Particulars", line): found_particulars = True; continue
-        if re.search(r"(?i)Sub\s*Total|Total", line): break
+        if re.search(r"(?i)Particulars|Description|Details", line): found_particulars = True; continue
+        if re.search(r"(?i)Sub\s*Total|Total|Payable", line): break
         if found_particulars and len(line) > 5: remarks_lines.append(line)
     data['remarks'] = " | ".join(remarks_lines) if remarks_lines else "Not Found"
-    return data
+    return data, category
 
-# --- OCR ENGINE ---
 def process_document(file_content, mime_type):
     try:
-        creds_data = get_credentials()
-        credentials = service_account.Credentials.from_service_account_info(creds_data)
-        client = documentai.DocumentProcessorServiceClient(
-            client_options={"api_endpoint": f"{LOCATION}-documentai.googleapis.com"}, 
-            credentials=credentials
-        )
-        name = client.processor_path(creds_data["project_id"], LOCATION, creds_data["processor_id"])
+        credentials = get_credentials()
+        processor_id = get_processor_id()
+        client = documentai.DocumentProcessorServiceClient(client_options={"api_endpoint": f"{LOCATION}-documentai.googleapis.com"}, credentials=credentials)
+        # Re-derive project_id from credentials
+        project_id = "casa-dental-ops"
+        if "gcp_service_account" in st.secrets:
+            project_id = st.secrets["gcp_service_account"]["project_id"]
+        else:
+            with open("credentials.json", "r") as f: project_id = json.load(f)["project_id"]
+
+        name = client.processor_path(project_id, LOCATION, processor_id)
         raw_document = documentai.RawDocument(content=file_content, mime_type=mime_type)
         request = documentai.ProcessRequest(name=name, raw_document=raw_document)
         return client.process_document(request=request).document.text
-    except Exception as e:
-        log_to_ui(f"OCR ERROR: {str(e)}", type="error"); return None
+    except Exception as e: log_to_ui(f"ERROR: {str(e)}", type="error"); return None
 
 # --- STREAMLIT UI ---
 st.set_page_config(page_title="Casa Dental Hub", page_icon="🦷", layout="wide")
 st.title("🦷 Casa Dental - Operations Hub")
 
+Base.metadata.create_all(bind=engine)
+start_background_tracker()
+
 tab1, tab2 = st.tabs(["📤 Upload Documents (OCR)", "📋 View Records"])
 
 with tab1:
-    uploaded_files = st.file_uploader("Choose files", type=["pdf", "png", "jpg", "jpeg", "tiff"], accept_multiple_files=True)
+    st.markdown("### Step 1: Upload Files")
+    uploaded_files = st.file_uploader("Drop invoices here", type=["pdf", "png", "jpg", "jpeg", "tiff"], accept_multiple_files=True)
     if uploaded_files:
-        st.divider()
-        for uploaded_file in uploaded_files:
-            with st.expander(f"📄 Processing: {uploaded_file.name}", expanded=True):
-                file_bytes = uploaded_file.read()
-                extracted_text = process_document(file_bytes, uploaded_file.type)
-                if extracted_text:
-                    inv_data = extract_invoice_data(extracted_text)
-                    inv_data['filename'] = uploaded_file.name
-                    if inv_data['total_amount'] != "Not Found":
-                        save_to_gsheet(inv_data)
-                        update_settlement_cell(inv_data['total_amount'])
-                        st.success(f"Processed: Total ${inv_data['total_amount']}")
-                        st.json(inv_data)
-                    else: st.warning("No Total found.")
-                else: st.error("OCR Failed.")
+        if st.button("🚀 Start OCR Processing", type="primary"):
+            st.divider(); sp_batch = []; st.session_state['pending_fwl'] = []
+            for uploaded_file in uploaded_files:
+                with st.status(f"🔍 Analyzing: {uploaded_file.name}") as status:
+                    file_bytes = uploaded_file.read()
+                    extracted_text = process_document(file_bytes, uploaded_file.type)
+                    if extracted_text:
+                        inv_data, category = extract_invoice_data(extracted_text, uploaded_file.name)
+                        if category == "SP":
+                            save_to_db(uploaded_file.name, inv_data, "SP"); sp_batch.append(float(inv_data['total_amount']))
+                        elif category == "FWL":
+                            st.session_state['pending_fwl'].append({"filename": uploaded_file.name, "data": inv_data})
+                        else:
+                            rec_id = save_to_db(uploaded_file.name, inv_data, category)
+                            update_google_sheet(inv_data['total_amount'], category, uploaded_file.name, rec_id)
+                        status.update(label=f"Done: {uploaded_file.name}", state="complete")
+            if sp_batch:
+                st.session_state['sp_batch_total'] = sum(sp_batch); st.session_state['sp_batch_count'] = len(sp_batch)
+
+        if st.session_state.get('pending_fwl'):
+            st.divider(); st.subheader("🏥 Pending FWL Confirmation")
+            for idx, item in enumerate(st.session_state['pending_fwl']):
+                col_a, col_b, col_c = st.columns([2, 2, 1])
+                with col_a: st.write(f"**File:** {item['filename']}")
+                with col_b: clinic = st.selectbox(f"Clinic for {item['filename']}", CLINICS, key=f"sel_{idx}")
+                with col_c:
+                    if st.button(f"Sync: {item['filename']}", key=f"btn_{idx}"):
+                        item['data']['bill_to'] = clinic; rid = save_to_db(item['filename'], item['data'], "FWL")
+                        update_google_sheet(item['data']['total_amount'], "FWL", item['filename'], rid)
+                        st.session_state['pending_fwl'].pop(idx); st.rerun()
+
+        if 'sp_batch_total' in st.session_state:
+            st.divider(); st.subheader("📊 SP Batch Ready")
+            st.info(f"Total Sum: **${st.session_state['sp_batch_total']:.2f}**")
+            if st.button("🚀 Sync SP Total to C42"):
+                update_google_sheet(f"{st.session_state['sp_batch_total']:.2f}", "SP", "Batch Update")
+                del st.session_state['sp_batch_total']; st.balloons()
 
 with tab2:
-    st.subheader("📊 Google Sheets Records")
+    st.subheader("📊 Database Records")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("### 📑 CK (C39)")
+        try:
+            db = SessionLocal(); res = db.query(CKSecreterial).order_by(CKSecreterial.timestamp.desc()).all(); db.close()
+            if res: st.dataframe(pd.DataFrame([{"Date": r.invoice_date, "Total": f"${r.total_amount}", "Remarks": r.remarks} for r in res]), use_container_width=True)
+        except: pass
+    with col2:
+        st.markdown("### ⚡ SP (C42)")
+        try:
+            db = SessionLocal(); res = db.query(SPTable).order_by(SPTable.timestamp.desc()).all(); db.close()
+            if res: st.dataframe(pd.DataFrame([{"Clinic": r.clinic_name, "Total": f"${r.total_amount}"} for r in res]), use_container_width=True)
+        except: pass
+    
+    st.markdown("### 🏢 FWL (C68)")
     try:
-        gc = get_gsheet_client()
-        sh = gc.open_by_key(SPREADSHEET_ID)
-        worksheet = sh.worksheet("OCR_RECORDS")
-        data = worksheet.get_all_records()
-        if data:
-            st.dataframe(pd.DataFrame(data), use_container_width=True)
-        else: st.info("No records in 'OCR_RECORDS' tab yet.")
-    except Exception as e:
-        st.error(f"Connect to Google Sheet to see records: {str(e)}")
+        db = SessionLocal(); res = db.query(FWLTable).order_by(FWLTable.timestamp.desc()).all(); db.close()
+        if res: st.dataframe(pd.DataFrame([{"Clinic": r.clinic_name, "Total": f"${r.total_payable}", "Time": r.timestamp.strftime("%H:%M")} for r in res]), use_container_width=True)
+    except: pass
+
+    st.divider(); st.markdown("### 🔍 Full Audit Trail")
+    try:
+        db = SessionLocal(); res = db.query(CellChange).order_by(CellChange.timestamp.desc()).limit(50).all(); db.close()
+        if res: st.dataframe(pd.DataFrame([{"Table": r.source_table, "ID": r.source_id, "Cell": r.cell_reference, "Old": r.old_value, "New": r.new_value, "Time": r.timestamp.strftime("%H:%M")} for r in res]), use_container_width=True)
+    except: pass
