@@ -34,6 +34,34 @@ def get_credentials():
 def get_gsheet_client():
     return gspread.authorize(get_credentials())
 
+def parse_amount(value):
+    if value is None:
+        return 0.0
+    txt = str(value).strip().replace(",", "")
+    if not txt:
+        return 0.0
+    try:
+        return float(txt)
+    except ValueError:
+        return 0.0
+
+def format_amount(value):
+    return f"{float(value):.2f}"
+
+def is_duplicate_manual_change(db: Session, cell_ref: str, new_val: str) -> bool:
+    """Guard against duplicate inserts for the same manual sheet edit."""
+    last_change = (
+        db.query(CellChange)
+        .filter(CellChange.cell_reference == cell_ref)
+        .order_by(CellChange.timestamp.desc())
+        .first()
+    )
+    if not last_change:
+        return False
+
+    # If the latest log already has the same target value, skip duplicate logging.
+    return str(last_change.new_value).strip() == str(new_val).strip()
+
 def update_google_sheet(amount, category, filename, record_id=None):
     try:
         client = get_gsheet_client()
@@ -44,23 +72,28 @@ def update_google_sheet(amount, category, filename, record_id=None):
         cell_ref = cell_map.get(category)
         
         if cell_ref:
+            final_amount = amount
+            if category == "CK":
+                current_val = settlement.acell(cell_ref).value
+                final_amount = format_amount(parse_amount(current_val) + parse_amount(amount))
+
             # Update the Shared Brain in the sheet so the tracker knows this was us
             try:
                 sync_sheet = spreadsheet.worksheet("_SYNC_STATE_")
                 cell_list = sync_sheet.col_values(1)
                 row_idx = cell_list.index(cell_ref) + 1
-                sync_sheet.update_cell(row_idx, 2, str(amount))
+                sync_sheet.update_cell(row_idx, 2, str(final_amount))
             except: pass 
             
             # Perform update
-            settlement.update_acell(cell_ref, amount)
+            settlement.update_acell(cell_ref, final_amount)
             
             # Audit log
             db = SessionLocal()
             label_val = settlement.acell(f"A{cell_ref[1:]}").value
-            audit = CellChange(sheet_name="Settlement", cell_reference=cell_ref, label_name=str(label_val), old_value="OCR Upload", new_value=str(amount), source_table=category, source_id=record_id, timestamp=datetime.utcnow())
+            audit = CellChange(sheet_name="Settlement", cell_reference=cell_ref, label_name=str(label_val), old_value="OCR Upload", new_value=str(final_amount), source_table=category, source_id=record_id, timestamp=datetime.utcnow())
             db.add(audit); db.commit(); db.close()
-            log_to_ui(f"✅ Synced {category} to {cell_ref} (${amount})", type="success")
+            log_to_ui(f"✅ Synced {category} to {cell_ref} (${final_amount})", type="success")
     except Exception as e:
         log_to_ui(f"❌ Sheet Sync Error: {e}", type="error")
 
@@ -154,22 +187,29 @@ def background_polling_loop():
                     db = SessionLocal()
                     row_num = re.findall(r'\d+', cell_ref)[0]
                     label_val = settlement.acell(f"A{row_num}").value
+                    normalized_current_val = format_amount(parse_amount(current_val))
+                    normalized_last_logged_val = format_amount(parse_amount(last_logged_val))
+
+                    if is_duplicate_manual_change(db, cell_ref, normalized_current_val):
+                        db.close()
+                        logger.info(f"Skipped duplicate manual change for {cell_ref} -> {normalized_current_val}")
+                        continue
                     
                     source_table, source_id = None, None
                     if cell_ref == "C39":
-                        entry = CKSecreterial(filename="Manual Entry", total_amount=current_val, remarks="Manual edit in Sheet", timestamp=datetime.utcnow())
+                        entry = CKSecreterial(filename="Manual Entry", total_amount=normalized_current_val, remarks="Manual edit in Sheet", timestamp=datetime.utcnow())
                         db.add(entry); db.flush(); source_table, source_id = "CK", entry.id
                     elif cell_ref == "C42":
-                        entry = SPTable(filename="Manual Entry", total_amount=current_val, remarks="Manual edit in Sheet", timestamp=datetime.utcnow())
+                        entry = SPTable(filename="Manual Entry", total_amount=normalized_current_val, remarks="Manual edit in Sheet", timestamp=datetime.utcnow())
                         db.add(entry); db.flush(); source_table, source_id = "SP", entry.id
                     elif cell_ref == "C68":
-                        entry = FWLTable(filename="Manual Entry", total_payable=current_val, remarks="Manual edit in Sheet", timestamp=datetime.utcnow())
+                        entry = FWLTable(filename="Manual Entry", total_payable=normalized_current_val, remarks="Manual edit in Sheet", timestamp=datetime.utcnow())
                         db.add(entry); db.flush(); source_table, source_id = "FWL", entry.id
                     
-                    audit = CellChange(sheet_name="Settlement", cell_reference=cell_ref, label_name=str(label_val), old_value=last_logged_val, new_value=current_val, source_table=source_table, source_id=source_id, timestamp=datetime.utcnow())
+                    audit = CellChange(sheet_name="Settlement", cell_reference=cell_ref, label_name=str(label_val), old_value=normalized_last_logged_val, new_value=normalized_current_val, source_table=source_table, source_id=source_id, timestamp=datetime.utcnow())
                     db.add(audit); db.commit(); db.close()
                     
-                    logger.info(f"SUCCESS: Recorded manual change in {cell_ref} as {current_val}")
+                    logger.info(f"SUCCESS: Recorded manual change in {cell_ref} as {normalized_current_val}")
             
             time.sleep(15) 
         except Exception as e:
