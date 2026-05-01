@@ -23,8 +23,9 @@ def log_to_ui(msg, type="info"):
     else: st.info(msg)
 
 # --- GOOGLE SHEETS SETUP ---
-SHEET_ID = "1FLeADEkmIJTJ-8E88lELpiJX1ARoK5D4tjSn2qcsU10" 
+SHEET_ID = "1FLeADEkmIJTJ-8E88lELpiJX1ARoK5D4tjSn2qcsU10"
 SETTLEMENT_GID = 305885354
+CK_AMK_SETTLEMENT_GID = 1365255493
 LOCATION = "us"
 CK_STATIC_COLUMNS = [
     "filename",
@@ -76,12 +77,38 @@ SHEET_POLL_INTERVAL_SECONDS = 5
 FOREGROUND_SYNC_COOLDOWN_SECONDS = 5
 
 def _load_service_account_info():
+    # 1) Streamlit Cloud secrets.toml
     try:
         service_account_info = st.secrets.get("gcp_service_account", None)
         if service_account_info:
             return service_account_info
     except Exception as e:
-        logger.warning(f"Streamlit secrets unavailable, falling back to credentials.json: {e}")
+        logger.warning(f"Streamlit secrets unavailable, trying env/file fallback: {e}")
+
+    # 2) Local/deployment env var with full JSON payload
+    for env_key in ("GCP_SERVICE_ACCOUNT_JSON", "GOOGLE_SERVICE_ACCOUNT_JSON"):
+        raw = os.environ.get(env_key, "").strip()
+        if not raw:
+            continue
+        try:
+            payload = json.loads(raw)
+            # If newlines are escaped in env var, normalize once.
+            if isinstance(payload, dict) and isinstance(payload.get("private_key"), str):
+                payload["private_key"] = payload["private_key"].replace("\\n", "\n")
+            return payload
+        except Exception as e:
+            logger.warning(f"Unable to parse {env_key}: {e}")
+
+    # 3) Local file path from env or default credentials.json
+    credentials_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "credentials.json")
+    if os.path.exists(credentials_path):
+        try:
+            with open(credentials_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if isinstance(payload, dict):
+                return payload
+        except Exception as e:
+            logger.warning(f"Unable to parse credentials file {credentials_path}: {e}")
     return None
 
 def get_sheet_credentials():
@@ -89,7 +116,8 @@ def get_sheet_credentials():
     service_account_info = _load_service_account_info()
     if service_account_info:
         return Credentials.from_service_account_info(service_account_info, scopes=scopes)
-    return Credentials.from_service_account_file("credentials.json", scopes=scopes)
+    credentials_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "credentials.json")
+    return Credentials.from_service_account_file(credentials_path, scopes=scopes)
 
 def get_documentai_credentials():
     # Document AI needs cloud-platform scope. Using sheet scopes can return 401.
@@ -97,7 +125,8 @@ def get_documentai_credentials():
     service_account_info = _load_service_account_info()
     if service_account_info:
         return Credentials.from_service_account_info(service_account_info, scopes=scopes)
-    return Credentials.from_service_account_file("credentials.json", scopes=scopes)
+    credentials_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "credentials.json")
+    return Credentials.from_service_account_file(credentials_path, scopes=scopes)
 
 def get_gsheet_client():
     return gspread.authorize(get_sheet_credentials())
@@ -315,42 +344,49 @@ def update_google_sheet(amount, category, filename, record_id=None):
         client = get_gsheet_client()
         spreadsheet = client.open_by_key(SHEET_ID)
         settlement = spreadsheet.get_worksheet_by_id(SETTLEMENT_GID)
-        
+        ck_settlement = spreadsheet.get_worksheet_by_id(CK_AMK_SETTLEMENT_GID)
+
         cell_map = {"CK": "C39", "SP": "C42"}
         cell_ref = cell_map.get(category)
-        
+
         if cell_ref:
+            target_sheet = ck_settlement if category == "CK" else settlement
+            state_cell_ref = f"CK_AMK:{cell_ref}" if category == "CK" else cell_ref
             db = SessionLocal()
-            state = db.query(SheetState).filter(SheetState.cell_reference == cell_ref).first()
+            state = db.query(SheetState).filter(SheetState.cell_reference == state_cell_ref).first()
             final_amount = amount
             if category == "CK":
                 # Prefer DB-tracked state for append baseline to avoid read quota failures.
                 baseline_val = state.last_value if state else "0"
                 if parse_amount(baseline_val) == 0:
                     try:
-                        baseline_val = call_with_quota_retry(lambda: settlement.acell(cell_ref).value or "0")
+                        baseline_val = call_with_quota_retry(lambda: target_sheet.acell(cell_ref).value or "0")
                     except Exception:
                         baseline_val = "0"
                 final_amount = format_amount(parse_amount(baseline_val) + parse_amount(amount))
-            
+
             # Perform update
-            call_with_quota_retry(lambda: settlement.update_acell(cell_ref, final_amount))
-            
+            call_with_quota_retry(lambda: target_sheet.update_acell(cell_ref, final_amount))
+
             # Audit log
             if not state:
-                state = SheetState(cell_reference=cell_ref, last_value=str(final_amount), last_updated=datetime.utcnow())
+                state = SheetState(cell_reference=state_cell_ref, last_value=str(final_amount), last_updated=datetime.utcnow())
                 db.add(state)
             else:
                 state.last_value = str(final_amount)
                 state.last_updated = datetime.utcnow()
 
             try:
-                label_val = call_with_quota_retry(lambda: settlement.acell(f"A{cell_ref[1:]}").value or "")
+                label_val = call_with_quota_retry(lambda: target_sheet.acell(f"A{cell_ref[1:]}").value or "")
             except Exception:
                 label_val = ""
-            audit = CellChange(sheet_name="Settlement", cell_reference=cell_ref, label_name=str(label_val), old_value="OCR Upload", new_value=str(final_amount), source_table=category, source_id=record_id, timestamp=datetime.utcnow())
+            audit_sheet_name = target_sheet.title if target_sheet else "Settlement"
+            audit = CellChange(sheet_name=audit_sheet_name, cell_reference=cell_ref, label_name=str(label_val), old_value="OCR Upload", new_value=str(final_amount), source_table=category, source_id=record_id, timestamp=datetime.utcnow())
             db.add(audit); db.commit(); db.close()
-            log_to_ui(f"✅ Synced {category} to {cell_ref} (${final_amount})", type="success")
+            if category == "CK":
+                log_to_ui(f"✅ Synced CK to AMK settlement ({audit_sheet_name}!{cell_ref}) (${final_amount})", type="success")
+            else:
+                log_to_ui(f"✅ Synced {category} to {cell_ref} (${final_amount})", type="success")
     except Exception as e:
         log_to_ui(f"❌ Sheet Sync Error: {e}", type="error")
 
@@ -487,22 +523,9 @@ def start_background_tracker():
 # --- OCR ENGINE ---
 from google.cloud import documentai
 def get_processor_id():
-    try:
-        service_account_info = st.secrets.get("gcp_service_account", None)
-        if isinstance(service_account_info, dict) and service_account_info.get("processor_id"):
-            return str(service_account_info["processor_id"])
-    except Exception:
-        pass
-
-    credentials_path = "credentials.json"
-    if os.path.exists(credentials_path):
-        try:
-            with open(credentials_path, "r", encoding="utf-8") as f:
-                payload = json.load(f)
-            if payload.get("processor_id"):
-                return str(payload["processor_id"])
-        except Exception as e:
-            logger.warning(f"Unable to parse processor_id from credentials.json: {e}")
+    service_account_info = _load_service_account_info()
+    if isinstance(service_account_info, dict) and service_account_info.get("processor_id"):
+        return str(service_account_info["processor_id"])
 
     return "5ec65c9f9a56298"
 
