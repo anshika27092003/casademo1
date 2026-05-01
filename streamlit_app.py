@@ -216,6 +216,25 @@ def normalize_sp_payload(data):
                 payload[key] = str(value)
     return payload
 
+def normalize_fwl_payload(data, clinic_name=None):
+    """Ensure FWL payload is DB-safe and consistent."""
+    payload = {
+        "clinic_name": clinic_name or "Not Found",
+        "total_amount": "0.00",
+        "remarks": "Not Found",
+    }
+    if isinstance(data, dict):
+        if data.get("clinic_name") or data.get("bill_to"):
+            payload["clinic_name"] = str(data.get("clinic_name") or data.get("bill_to"))
+        if clinic_name:
+            payload["clinic_name"] = str(clinic_name)
+        raw_total = data.get("total_amount") or data.get("total_payable")
+        if raw_total not in (None, ""):
+            payload["total_amount"] = str(raw_total)
+        if data.get("remarks") not in (None, ""):
+            payload["remarks"] = str(data.get("remarks"))
+    return payload
+
 def parse_amount(value):
     if value is None:
         return 0.0
@@ -346,11 +365,12 @@ def save_to_db(filename, data, category):
                 timestamp=datetime.utcnow()
             )
         elif category == "FWL":
+            fwl_data = normalize_fwl_payload(data)
             entry = FWLTable(
                 filename=filename,
-                clinic_name=data.get("clinic_name") or data.get("bill_to"),
-                total_payable=data.get("total_amount"),
-                remarks=data.get("remarks"),
+                clinic_name=fwl_data.get("clinic_name"),
+                total_payable=fwl_data.get("total_amount"),
+                remarks=fwl_data.get("remarks"),
                 timestamp=datetime.utcnow()
             )
         
@@ -779,15 +799,17 @@ with tab1:
                 fwl_batch_total = 0.0
                 submitted_count = 0
                 last_rid = None
+                failed_files = []
                 for file_key, preview in fwl_candidates:
-                    inv = dict(preview["data"])
-                    inv["clinic_name"] = fwl_clinic
+                    inv = normalize_fwl_payload(preview["data"], clinic_name=fwl_clinic)
                     rid = save_to_db(preview["filename"], inv, "FWL")
                     if rid:
                         submitted_count += 1
                         fwl_batch_total += parse_amount(inv.get("total_amount"))
                         st.session_state['processed_fwl_batch'].add(file_key)
                         last_rid = rid
+                    else:
+                        failed_files.append(preview["filename"])
                 if submitted_count > 0:
                     update_fwl_sheet_for_clinic(
                         fwl_clinic,
@@ -799,8 +821,20 @@ with tab1:
                         f"Submitted {submitted_count} FWL record(s) for {fwl_clinic}. "
                         f"Appended ${format_amount(fwl_batch_total)} to {FWL_SETTLEMENT_CELL} on that clinic's sheet."
                     )
+                    if failed_files:
+                        st.warning(
+                            "Some FWL files failed to save: " + ", ".join(failed_files[:3]) +
+                            ("..." if len(failed_files) > 3 else "")
+                        )
                 else:
-                    st.error("No FWL records were submitted. Please check extracted values.")
+                    if failed_files:
+                        st.error(
+                            "No FWL records were submitted. Save failed for: " +
+                            ", ".join(failed_files[:3]) +
+                            ("..." if len(failed_files) > 3 else "")
+                        )
+                    else:
+                        st.error("No FWL records were submitted. Please check extracted values.")
 
         if st.button("✨ Process All"):
             for _, preview in st.session_state.get('ocr_preview', {}).items():
