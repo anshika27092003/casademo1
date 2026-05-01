@@ -367,6 +367,18 @@ def update_google_sheet(amount, category, filename, record_id=None):
 
             # Perform update
             call_with_quota_retry(lambda: target_sheet.update_acell(cell_ref, final_amount))
+            # Read back to ensure the update actually landed on the intended sheet/cell.
+            readback_val = call_with_quota_retry(lambda: target_sheet.acell(cell_ref).value or "0")
+            readback_amount = format_amount(parse_amount(readback_val))
+            expected_amount = format_amount(parse_amount(final_amount))
+            if readback_amount != expected_amount:
+                db.close()
+                log_to_ui(
+                    f"❌ Sheet verification mismatch on {target_sheet.title}!{cell_ref} (gid: {target_sheet.id}). "
+                    f"Expected ${expected_amount}, but found ${readback_amount}.",
+                    type="error",
+                )
+                return {"ok": False, "cell": cell_ref, "sheet_title": target_sheet.title, "gid": target_sheet.id, "value": readback_amount}
 
             # Audit log
             if not state:
@@ -387,8 +399,10 @@ def update_google_sheet(amount, category, filename, record_id=None):
                 log_to_ui(f"✅ Synced CK to AMK settlement ({audit_sheet_name}!{cell_ref}) (${final_amount})", type="success")
             else:
                 log_to_ui(f"✅ Synced {category} to {cell_ref} (${final_amount})", type="success")
+            return {"ok": True, "cell": cell_ref, "sheet_title": audit_sheet_name, "gid": target_sheet.id, "value": expected_amount}
     except Exception as e:
         log_to_ui(f"❌ Sheet Sync Error: {e}", type="error")
+    return {"ok": False}
 
 def save_to_db(filename, data, category):
     db = SessionLocal()
@@ -747,9 +761,21 @@ with tab1:
                     ck_row = db.query(CKSecreterial).filter(CKSecreterial.id == rid).first()
                     db.close()
                     if ck_row:
-                        update_google_sheet(ck_row.total_amount, "CK", preview["filename"], rid)
-                        st.session_state['auto_processed_ck'].add(file_key)
-                        preview["auto_status"] = f"Saved to CK and synced to AMK settlement C39 (gid: {CK_AMK_SETTLEMENT_GID})"
+                        sync_result = update_google_sheet(ck_row.total_amount, "CK", preview["filename"], rid)
+                        if sync_result and sync_result.get("ok"):
+                            st.session_state['auto_processed_ck'].add(file_key)
+                            preview["auto_status"] = (
+                                "Saved to CK and synced to "
+                                f"{sync_result.get('sheet_title', 'AMK settlement')} "
+                                f"{sync_result.get('cell', 'C39')} "
+                                f"(gid: {sync_result.get('gid', CK_AMK_SETTLEMENT_GID)}) "
+                                f"-> ${sync_result.get('value', '0.00')}"
+                            )
+                        else:
+                            preview["auto_status"] = (
+                                "Saved to CK, but sheet sync verification failed. "
+                                f"Please check AMK settlement C39 (gid: {CK_AMK_SETTLEMENT_GID})."
+                            )
                     else:
                         preview["auto_status"] = "Saved failed: CK row not found after insert"
                 else:
