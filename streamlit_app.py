@@ -749,7 +749,7 @@ with tab1:
                     if ck_row:
                         update_google_sheet(ck_row.total_amount, "CK", preview["filename"], rid)
                         st.session_state['auto_processed_ck'].add(file_key)
-                        preview["auto_status"] = "Saved to CK and synced to C39"
+                        preview["auto_status"] = f"Saved to CK and synced to AMK settlement C39 (gid: {CK_AMK_SETTLEMENT_GID})"
                     else:
                         preview["auto_status"] = "Saved failed: CK row not found after insert"
                 else:
