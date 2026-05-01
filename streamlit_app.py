@@ -38,6 +38,16 @@ CK_STATIC_COLUMNS = [
     "total_amount",
     "remarks",
 ]
+SP_EXTRACTED_FIELDS = [
+    "supplier_name",
+    "clinic_name",
+    "invoice_date",
+    "tax_invoice_number",
+    "sub_total",
+    "gst_9_percent",
+    "total_amount",
+    "remarks",
+]
 
 def _load_service_account_info():
     try:
@@ -87,6 +97,34 @@ def normalize_ck_payload(filename, data):
         if value not in (None, ""):
             payload[key] = str(value)
     return {k: payload[k] for k in CK_STATIC_COLUMNS}
+
+def normalize_sp_payload(data):
+    """Keep SP extraction aligned to strict user-required keys."""
+    payload = {
+        "supplier_name": "Not Found",
+        "clinic_name": "Not Found",
+        "invoice_date": "Not Found",
+        "tax_invoice_number": "Not Found",
+        "sub_total": "Not Found",
+        "gst_9_percent": "0.00",
+        "total_amount": "Not Found",
+        "remarks": "Not Found",
+    }
+    if isinstance(data, dict):
+        mapping = {
+            "supplier_name": data.get("supplier_name"),
+            "clinic_name": data.get("clinic_name") or data.get("bill_to"),
+            "invoice_date": data.get("invoice_date"),
+            "tax_invoice_number": data.get("tax_invoice_number") or data.get("invoice_no"),
+            "sub_total": data.get("sub_total"),
+            "gst_9_percent": data.get("gst_9_percent") or data.get("gst_amount"),
+            "total_amount": data.get("total_amount"),
+            "remarks": data.get("remarks"),
+        }
+        for key, value in mapping.items():
+            if value not in (None, ""):
+                payload[key] = str(value)
+    return payload
 
 def parse_amount(value):
     if value is None:
@@ -170,16 +208,17 @@ def save_to_db(filename, data, category):
                 timestamp=datetime.utcnow()
             )
         elif category == "SP":
+            sp_data = normalize_sp_payload(data)
             entry = SPTable(
                 filename=filename,
-                supplier_name=data.get('supplier_name'),
-                clinic_name=data.get('bill_to'),
-                invoice_date=data.get('invoice_date'),
-                tax_invoice_number=data.get('invoice_no'),
-                sub_total=data.get('sub_total'),
-                gst_amount=data.get('gst_amount'),
-                total_amount=data.get('total_amount'),
-                remarks=data.get('remarks'),
+                supplier_name=sp_data.get('supplier_name'),
+                clinic_name=sp_data.get('clinic_name'),
+                invoice_date=sp_data.get('invoice_date'),
+                tax_invoice_number=sp_data.get('tax_invoice_number'),
+                sub_total=sp_data.get('sub_total'),
+                gst_amount=sp_data.get('gst_9_percent'),
+                total_amount=sp_data.get('total_amount'),
+                remarks=sp_data.get('remarks'),
                 timestamp=datetime.utcnow()
             )
         elif category == "FWL":
@@ -345,11 +384,26 @@ def extract_invoice_data(text, filename=""):
         data['total_amount'] = all_amounts[-1].replace(",", "")
     
     remarks_lines = []
-    found_particulars = False
+    found_description_start = False
     for line in lines:
-        if re.search(r"(?i)Particulars|Description|Details|Item", line): found_particulars = True; continue
-        if re.search(r"(?i)Sub\s*Total|Total|Payable|Thank\s+You", line): break
-        if found_particulars and len(line) > 5: remarks_lines.append(line)
+        # Detect the start of the items table
+        if re.search(r"(?i)Particulars|Description|Details|Item|Service", line):
+            found_description_start = True
+            continue
+        
+        # Detect the end of the items table
+        if re.search(r"(?i)Sub\s*Total|Total|Amount\s*Due|Payable|Thank\s+You|Payment\s+Details", line):
+            if found_description_start:
+                break
+        
+        if found_description_start:
+            # Clean up the line (remove quantities/prices if they are on the same line)
+            # Typically items are on the left, amounts on the right. 
+            # We just want the text part.
+            clean_line = re.sub(r"[\d,]+\.\d{2}\s*$", "", line).strip()
+            if len(clean_line) > 3:
+                remarks_lines.append(clean_line)
+    
     data['remarks'] = " | ".join(remarks_lines) if remarks_lines else "Not Found"
     
     if "Firmus" in str(data.get('supplier_name', '')) or "Firmus" in text or "SP" in filename:
@@ -364,6 +418,19 @@ def extract_invoice_data(text, filename=""):
         if m_sub: data['sub_total'] = m_sub.group(1).replace(",", "")
         m_total = re.search(r"(?i)Grand\s+Total\s*:\s*([\d,]+\.\d{2})", text)
         if m_total: data['total_amount'] = m_total.group(1).replace(",", "")
+        
+        # Specific remark for Firmus Cap (often looks like "Utilities for ...")
+        m_rem = re.search(r"(?i)(Utilities\s+for\s+[\d\-\/ ]+)", text)
+        if m_rem: data['remarks'] = m_rem.group(1).strip()
+        elif not remarks_lines:
+            # Fallback for Firmus: look for lines between "S/N" and "Sub Total"
+            f_rem = []
+            f_start = False
+            for line in lines:
+                if re.search(r"S/N", line): f_start = True; continue
+                if re.search(r"Sub\s+Total", line): break
+                if f_start and len(line) > 5: f_rem.append(line)
+            if f_rem: data['remarks'] = " | ".join(f_rem)
 
     return data, category
 
@@ -411,6 +478,8 @@ with tab1:
             st.session_state['ocr_preview'] = {}
         if 'auto_processed_ck' not in st.session_state:
             st.session_state['auto_processed_ck'] = set()
+        if 'processed_sp_batch' not in st.session_state:
+            st.session_state['processed_sp_batch'] = set()
 
         current_keys = set()
         for f in uploaded_files:
@@ -425,6 +494,8 @@ with tab1:
                         inv, cat = extract_invoice_data(text, f.name)
                         if cat == "CK":
                             inv = normalize_ck_payload(f.name, inv)
+                        elif cat == "SP":
+                            inv = normalize_sp_payload(inv)
                         st.session_state['ocr_preview'][file_key] = {
                             "filename": f.name,
                             "mime_type": f.type,
@@ -449,6 +520,9 @@ with tab1:
         }
         st.session_state['auto_processed_ck'] = {
             k for k in st.session_state['auto_processed_ck'] if k in current_keys
+        }
+        st.session_state['processed_sp_batch'] = {
+            k for k in st.session_state['processed_sp_batch'] if k in current_keys
         }
 
         # Auto flow for CK: save to CK table first, then sync stored total to C39.
@@ -487,6 +561,28 @@ with tab1:
             with st.expander("📄 Raw OCR Text"):
                 st.text(preview["text"])
 
+        sp_candidates = [
+            (k, v) for k, v in st.session_state.get('ocr_preview', {}).items()
+            if v.get("category") == "SP" and v.get("data") and k not in st.session_state['processed_sp_batch']
+        ]
+        if sp_candidates:
+            st.info(f"SP ready for batch submit: {len(sp_candidates)} file(s)")
+            if st.button("✅ Submit SP Batch"):
+                sp_batch_total = 0.0
+                submitted_count = 0
+                for file_key, preview in sp_candidates:
+                    sp_data = normalize_sp_payload(preview["data"])
+                    rid = save_to_db(preview["filename"], sp_data, "SP")
+                    if rid:
+                        submitted_count += 1
+                        sp_batch_total += parse_amount(sp_data.get("total_amount"))
+                        st.session_state['processed_sp_batch'].add(file_key)
+                if submitted_count > 0:
+                    update_google_sheet(format_amount(sp_batch_total), "SP", "SP Batch Submit")
+                    st.success(f"Submitted {submitted_count} SP record(s). Synced ${format_amount(sp_batch_total)} to settlement.")
+                else:
+                    st.error("No SP records were submitted. Please check extracted values.")
+
         if st.button("✨ Process All"):
             sp_batch = []
             st.session_state['pending_fwl'] = []
@@ -500,8 +596,7 @@ with tab1:
 
                 with st.status(f"Processing {f_name}"):
                     if cat == "SP":
-                        save_to_db(f_name, inv, "SP")
-                        sp_batch.append(float(str(inv['total_amount']).replace(",", "")))
+                        continue
                     elif cat == "FWL":
                         st.session_state['pending_fwl'].append({"filename": f_name, "data": inv})
                     elif cat != "CK":
@@ -523,9 +618,6 @@ with tab1:
 
         if 'sp_total' in st.session_state:
             st.success(f"Batch Total: ${st.session_state['sp_total']:.2f}")
-            if st.button("Confirm SP Sync"):
-                update_google_sheet(f"{st.session_state['sp_total']:.2f}", "SP", "Batch")
-                del st.session_state['sp_total']; st.rerun()
 
 with tab2:
     st.subheader("📋 Audit Trail")
@@ -538,6 +630,17 @@ with tab2:
         "bill_to",
         "sub_total",
         "gst_amount",
+        "total_amount",
+        "remarks",
+        "timestamp",
+    ]
+    SP_VIEW_COLUMNS = [
+        "supplier_name",
+        "clinic_name",
+        "invoice_date",
+        "tax_invoice_number",
+        "sub_total",
+        "gst_9_percent",
         "total_amount",
         "remarks",
         "timestamp",
@@ -558,6 +661,19 @@ with tab2:
             "timestamp": r.timestamp.strftime("%Y-%m-%d %H:%M:%S") if r.timestamp else "",
         }
 
+    def map_sp_row(r):
+        return {
+            "supplier_name": r.supplier_name or "Not Found",
+            "clinic_name": r.clinic_name or "Not Found",
+            "invoice_date": r.invoice_date or "Not Found",
+            "tax_invoice_number": r.tax_invoice_number or "Not Found",
+            "sub_total": r.sub_total or "Not Found",
+            "gst_9_percent": r.gst_amount or "0.00",
+            "total_amount": r.total_amount or "Not Found",
+            "remarks": r.remarks or "Not Found",
+            "timestamp": r.timestamp.strftime("%Y-%m-%d %H:%M:%S") if r.timestamp else "",
+        }
+
     def show(title, model, map_fn):
         st.write(f"### {title}")
         db = SessionLocal()
@@ -573,7 +689,14 @@ with tab2:
         ck_df = pd.DataFrame([map_ck_row(r) for r in ck_rows], columns=CK_VIEW_COLUMNS)
         st.dataframe(ck_df, use_container_width=True)
 
-    show("SP", SPTable, lambda r: {"File": r.filename, "Clinic": r.clinic_name, "Amt": r.total_amount})
+    st.write("### SP")
+    db = SessionLocal()
+    sp_rows = db.query(SPTable).order_by(SPTable.timestamp.desc()).all()
+    db.close()
+    if sp_rows:
+        sp_df = pd.DataFrame([map_sp_row(r) for r in sp_rows], columns=SP_VIEW_COLUMNS)
+        st.dataframe(sp_df, use_container_width=True)
+
     show("FWL", FWLTable, lambda r: {"File": r.filename, "Clinic": r.clinic_name, "Amt": r.total_payable})
     
     st.write("### 🔍 System Logs")
