@@ -49,6 +49,30 @@ SP_EXTRACTED_FIELDS = [
     "remarks",
 ]
 
+# FWL: user picks clinic; amount appends to C67 on that clinic's settlement worksheet.
+FWL_CLINICS = [
+    "ADMIRALTY",
+    "AMK",
+    "BATOK",
+    "CLEMENTI",
+    "HOLLAND",
+    "JURONG",
+    "KAMPUNG",
+    "TAMPINES",
+]
+# Map dropdown label -> substring that appears in the Google Sheet tab title (upper match).
+FWL_CLINIC_WORKSHEET_KEY = {
+    "ADMIRALTY": "ADM",
+    "AMK": "AMK",
+    "BATOK": "BEDOK",
+    "CLEMENTI": "CLEMENTI",
+    "HOLLAND": "HOLLAND",
+    "JURONG": "JURONG",
+    "KAMPUNG": "KAMPUNG",
+    "TAMPINES": "TAMPINES",
+}
+FWL_SETTLEMENT_CELL = "C67"
+
 def _load_service_account_info():
     try:
         service_account_info = st.secrets.get("gcp_service_account", None)
@@ -75,6 +99,66 @@ def get_documentai_credentials():
 
 def get_gsheet_client():
     return gspread.authorize(get_sheet_credentials())
+
+
+def fwl_sheet_state_key(worksheet_title):
+    return f"FWL|{worksheet_title}|{FWL_SETTLEMENT_CELL}"
+
+
+def resolve_fwl_worksheet(spreadsheet, clinic_label):
+    """Return the settlement worksheet for the selected clinic (tab title contains keyword)."""
+    keyword = FWL_CLINIC_WORKSHEET_KEY.get(clinic_label, clinic_label).upper()
+    for ws in spreadsheet.worksheets():
+        title_u = (ws.title or "").upper()
+        if keyword in title_u and "SETTLEMENT" in title_u:
+            return ws
+    for ws in spreadsheet.worksheets():
+        if keyword in (ws.title or "").upper():
+            return ws
+    return None
+
+
+def update_fwl_sheet_for_clinic(clinic_label, amount_to_append, filename, record_id=None):
+    """Append FWL total_payable to C67 on the clinic-specific settlement tab."""
+    try:
+        client = get_gsheet_client()
+        spreadsheet = client.open_by_key(SHEET_ID)
+        settlement_ws = resolve_fwl_worksheet(spreadsheet, clinic_label)
+        if not settlement_ws:
+            log_to_ui(f"❌ No settlement worksheet found for clinic: {clinic_label}", type="error")
+            return
+        cell_ref = FWL_SETTLEMENT_CELL
+        current_val = settlement_ws.acell(cell_ref).value
+        final_amount = format_amount(parse_amount(current_val) + parse_amount(amount_to_append))
+        settlement_ws.update_acell(cell_ref, final_amount)
+
+        state_key = fwl_sheet_state_key(settlement_ws.title)
+        db = SessionLocal()
+        state = db.query(SheetState).filter(SheetState.cell_reference == state_key).first()
+        if not state:
+            state = SheetState(cell_reference=state_key, last_value=str(final_amount), last_updated=datetime.utcnow())
+            db.add(state)
+        else:
+            state.last_value = str(final_amount)
+            state.last_updated = datetime.utcnow()
+        row_num = re.findall(r"\d+", cell_ref)[0]
+        label_val = settlement_ws.acell(f"A{row_num}").value
+        audit = CellChange(
+            sheet_name=settlement_ws.title,
+            cell_reference=state_key,
+            label_name=str(label_val),
+            old_value="FWL Upload",
+            new_value=str(final_amount),
+            source_table="FWL",
+            source_id=record_id,
+            timestamp=datetime.utcnow(),
+        )
+        db.add(audit)
+        db.commit()
+        db.close()
+        log_to_ui(f"✅ Synced FWL for {clinic_label} → {settlement_ws.title}!{cell_ref} (${final_amount})", type="success")
+    except Exception as e:
+        log_to_ui(f"❌ FWL Sheet Sync Error: {e}", type="error")
 
 def normalize_ck_payload(filename, data):
     """Keep CK data aligned to a strict, static CK table schema."""
@@ -160,7 +244,7 @@ def update_google_sheet(amount, category, filename, record_id=None):
         spreadsheet = client.open_by_key(SHEET_ID)
         settlement = spreadsheet.get_worksheet_by_id(SETTLEMENT_GID)
         
-        cell_map = {"CK": "C39", "SP": "C42", "FWL": "C68"}
+        cell_map = {"CK": "C39", "SP": "C42"}
         cell_ref = cell_map.get(category)
         
         if cell_ref:
@@ -224,9 +308,9 @@ def save_to_db(filename, data, category):
         elif category == "FWL":
             entry = FWLTable(
                 filename=filename,
-                clinic_name=data.get('bill_to'),
-                total_payable=data.get('total_amount'),
-                remarks=data.get('remarks'),
+                clinic_name=data.get("clinic_name") or data.get("bill_to"),
+                total_payable=data.get("total_amount"),
+                remarks=data.get("remarks"),
                 timestamp=datetime.utcnow()
             )
         
@@ -255,7 +339,7 @@ def background_polling_loop():
         time.sleep(15)
 
 def sync_sheet_changes_once():
-    cells = ["C39", "C42", "C68"]
+    cells = ["C39", "C42"]
     db = None
     try:
         client = get_gsheet_client()
@@ -292,16 +376,59 @@ def sync_sheet_changes_once():
                 elif cell_ref == "C42":
                     entry = SPTable(filename="Manual Entry", total_amount=normalized_current_val, remarks="Manual edit in Sheet", timestamp=datetime.utcnow())
                     db.add(entry); db.flush(); source_table, source_id = "SP", entry.id
-                elif cell_ref == "C68":
-                    entry = FWLTable(filename="Manual Entry", total_payable=normalized_current_val, remarks="Manual edit in Sheet", timestamp=datetime.utcnow())
-                    db.add(entry); db.flush(); source_table, source_id = "FWL", entry.id
-                
                 audit = CellChange(sheet_name="Settlement", cell_reference=cell_ref, label_name=str(label_val), old_value=normalized_last_logged_val, new_value=normalized_current_val, source_table=source_table, source_id=source_id, timestamp=datetime.utcnow())
                 state.last_value = normalized_current_val
                 state.last_updated = datetime.utcnow()
                 db.add(audit); db.commit()
                 
                 logger.info(f"SUCCESS: Recorded manual change in {cell_ref} as {normalized_current_val}")
+
+        # FWL: each clinic tab has its own C67 — track manual edits per tab.
+        for clinic_label in FWL_CLINICS:
+            fwl_ws = resolve_fwl_worksheet(spreadsheet, clinic_label)
+            if not fwl_ws:
+                continue
+            cell_ref = FWL_SETTLEMENT_CELL
+            state_key = fwl_sheet_state_key(fwl_ws.title)
+            current_val = format_amount(parse_amount(fwl_ws.acell(cell_ref).value or "0"))
+            state = db.query(SheetState).filter(SheetState.cell_reference == state_key).first()
+            if not state:
+                db.add(SheetState(cell_reference=state_key, last_value=current_val, last_updated=datetime.utcnow()))
+                db.commit()
+                continue
+            last_logged_val = format_amount(parse_amount(state.last_value))
+            if current_val != last_logged_val:
+                row_num = re.findall(r"\d+", cell_ref)[0]
+                label_val = fwl_ws.acell(f"A{row_num}").value
+                if is_duplicate_manual_change(db, state_key, current_val):
+                    state.last_value = current_val
+                    state.last_updated = datetime.utcnow()
+                    db.commit()
+                    continue
+                entry = FWLTable(
+                    filename="Manual Entry",
+                    clinic_name=clinic_label,
+                    total_payable=current_val,
+                    remarks="Manual edit in Sheet",
+                    timestamp=datetime.utcnow(),
+                )
+                db.add(entry)
+                db.flush()
+                audit = CellChange(
+                    sheet_name=fwl_ws.title,
+                    cell_reference=state_key,
+                    label_name=str(label_val),
+                    old_value=last_logged_val,
+                    new_value=current_val,
+                    source_table="FWL",
+                    source_id=entry.id,
+                    timestamp=datetime.utcnow(),
+                )
+                state.last_value = current_val
+                state.last_updated = datetime.utcnow()
+                db.add(audit)
+                db.commit()
+                logger.info(f"SUCCESS: Recorded FWL manual change {fwl_ws.title} {cell_ref} as {current_val}")
     except Exception as e:
         logger.error(f"Polling error: {e}")
     finally:
@@ -484,6 +611,8 @@ with tab1:
             st.session_state['auto_processed_ck'] = set()
         if 'processed_sp_batch' not in st.session_state:
             st.session_state['processed_sp_batch'] = set()
+        if 'processed_fwl_batch' not in st.session_state:
+            st.session_state['processed_fwl_batch'] = set()
 
         current_keys = set()
         for f in uploaded_files:
@@ -527,6 +656,9 @@ with tab1:
         }
         st.session_state['processed_sp_batch'] = {
             k for k in st.session_state['processed_sp_batch'] if k in current_keys
+        }
+        st.session_state['processed_fwl_batch'] = {
+            k for k in st.session_state['processed_fwl_batch'] if k in current_keys
         }
 
         # Auto flow for CK: save to CK table first, then sync stored total to C39.
@@ -587,9 +719,45 @@ with tab1:
                 else:
                     st.error("No SP records were submitted. Please check extracted values.")
 
+        fwl_candidates = [
+            (k, v) for k, v in st.session_state.get('ocr_preview', {}).items()
+            if v.get("category") == "FWL" and v.get("data") and k not in st.session_state['processed_fwl_batch']
+        ]
+        if fwl_candidates:
+            st.info(f"FWL ready for batch submit: {len(fwl_candidates)} file(s). Select clinic and confirm.")
+            fwl_clinic = st.selectbox("Clinic for FWL upload(s)", FWL_CLINICS, key="fwl_batch_clinic")
+            fwl_confirm = st.checkbox(
+                f"I confirm uploading these FWL document(s) for clinic: **{fwl_clinic}**",
+                key="fwl_batch_confirm",
+            )
+            if st.button("✅ Submit FWL Batch", disabled=not fwl_confirm):
+                fwl_batch_total = 0.0
+                submitted_count = 0
+                last_rid = None
+                for file_key, preview in fwl_candidates:
+                    inv = dict(preview["data"])
+                    inv["clinic_name"] = fwl_clinic
+                    rid = save_to_db(preview["filename"], inv, "FWL")
+                    if rid:
+                        submitted_count += 1
+                        fwl_batch_total += parse_amount(inv.get("total_amount"))
+                        st.session_state['processed_fwl_batch'].add(file_key)
+                        last_rid = rid
+                if submitted_count > 0:
+                    update_fwl_sheet_for_clinic(
+                        fwl_clinic,
+                        format_amount(fwl_batch_total),
+                        "FWL Batch Submit",
+                        last_rid,
+                    )
+                    st.success(
+                        f"Submitted {submitted_count} FWL record(s) for {fwl_clinic}. "
+                        f"Appended ${format_amount(fwl_batch_total)} to {FWL_SETTLEMENT_CELL} on that clinic's sheet."
+                    )
+                else:
+                    st.error("No FWL records were submitted. Please check extracted values.")
+
         if st.button("✨ Process All"):
-            sp_batch = []
-            st.session_state['pending_fwl'] = []
             for _, preview in st.session_state.get('ocr_preview', {}).items():
                 if not preview.get("data"):
                     continue
@@ -599,29 +767,10 @@ with tab1:
                 cat = preview["category"]
 
                 with st.status(f"Processing {f_name}"):
-                    if cat == "SP":
+                    if cat in ("SP", "FWL", "CK"):
                         continue
-                    elif cat == "FWL":
-                        st.session_state['pending_fwl'].append({"filename": f_name, "data": inv})
-                    elif cat != "CK":
-                        rid = save_to_db(f_name, inv, cat)
-                        update_google_sheet(inv['total_amount'], cat, f_name, rid)
-
-            if sp_batch:
-                st.session_state['sp_total'] = sum(sp_batch)
-                st.session_state['sp_count'] = len(sp_batch)
-
-        if st.session_state.get('pending_fwl'):
-            for i, item in enumerate(st.session_state['pending_fwl']):
-                clinic = st.selectbox(f"Clinic for {item['filename']}", ["ADMIRALTY", "AMK", "BATOK", "CLEMENTI", "HOLLAND", "JURONG", "KAMPUNG", "TAMPINES"], key=f"fwl_{i}")
-                if st.button(f"Sync {item['filename']}"):
-                    item['data']['bill_to'] = clinic
-                    rid = save_to_db(item['filename'], item['data'], "FWL")
-                    update_google_sheet(item['data']['total_amount'], "FWL", item['filename'], rid)
-                    st.session_state['pending_fwl'].pop(i); st.rerun()
-
-        if 'sp_total' in st.session_state:
-            st.success(f"Batch Total: ${st.session_state['sp_total']:.2f}")
+                    rid = save_to_db(f_name, inv, cat)
+                    update_google_sheet(inv['total_amount'], cat, f_name, rid)
 
 with tab2:
     st.subheader("📋 Audit Trail")
@@ -646,6 +795,13 @@ with tab2:
         "sub_total",
         "gst_9_percent",
         "total_amount",
+        "remarks",
+        "timestamp",
+    ]
+    FWL_VIEW_COLUMNS = [
+        "filename",
+        "clinic_name",
+        "total_payable",
         "remarks",
         "timestamp",
     ]
@@ -678,12 +834,14 @@ with tab2:
             "timestamp": r.timestamp.strftime("%Y-%m-%d %H:%M:%S") if r.timestamp else "",
         }
 
-    def show(title, model, map_fn):
-        st.write(f"### {title}")
-        db = SessionLocal()
-        rows = db.query(model).order_by(model.timestamp.desc()).all()
-        db.close()
-        if rows: st.dataframe(pd.DataFrame([map_fn(r) for r in rows]), use_container_width=True)
+    def map_fwl_row(r):
+        return {
+            "filename": r.filename or "Not Found",
+            "clinic_name": r.clinic_name or "Not Found",
+            "total_payable": r.total_payable or "Not Found",
+            "remarks": r.remarks or "Not Found",
+            "timestamp": r.timestamp.strftime("%Y-%m-%d %H:%M:%S") if r.timestamp else "",
+        }
 
     st.write("### CK")
     db = SessionLocal()
@@ -701,7 +859,13 @@ with tab2:
         sp_df = pd.DataFrame([map_sp_row(r) for r in sp_rows], columns=SP_VIEW_COLUMNS)
         st.dataframe(sp_df, use_container_width=True)
 
-    show("FWL", FWLTable, lambda r: {"File": r.filename, "Clinic": r.clinic_name, "Amt": r.total_payable})
+    st.write("### FWL")
+    db = SessionLocal()
+    fwl_rows = db.query(FWLTable).order_by(FWLTable.timestamp.desc()).all()
+    db.close()
+    if fwl_rows:
+        fwl_df = pd.DataFrame([map_fwl_row(r) for r in fwl_rows], columns=FWL_VIEW_COLUMNS)
+        st.dataframe(fwl_df, use_container_width=True)
     
     st.write("### 🔍 System Logs")
     db = SessionLocal()
