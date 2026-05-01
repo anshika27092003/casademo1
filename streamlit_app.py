@@ -354,10 +354,15 @@ def is_duplicate_manual_change(db: Session, cell_ref: str, new_val: str) -> bool
     return str(last_change.new_value).strip() == str(new_val).strip()
 
 def update_google_sheet(amount, category, filename, record_id=None):
+    sync_debug = []
     try:
+        sync_debug.append("init_client")
         client = get_gsheet_client()
+        sync_debug.append("open_spreadsheet")
         spreadsheet = client.open_by_key(SHEET_ID)
+        sync_debug.append(f"load_default_settlement_gid:{SETTLEMENT_GID}")
         settlement = spreadsheet.get_worksheet_by_id(SETTLEMENT_GID)
+        sync_debug.append(f"resolve_ck_target_gid:{CK_AMK_SETTLEMENT_GID}")
         ck_settlement = resolve_ck_amk_worksheet(spreadsheet)
 
         cell_map = {"CK": "C39", "SP": "C42"}
@@ -366,12 +371,24 @@ def update_google_sheet(amount, category, filename, record_id=None):
         if cell_ref:
             target_sheet = ck_settlement if category == "CK" else settlement
             if target_sheet is None:
+                logger.error(
+                    "Sheet sync target not found | category=%s expected_gid=%s debug=%s",
+                    category,
+                    CK_AMK_SETTLEMENT_GID,
+                    " > ".join(sync_debug),
+                )
                 log_to_ui(
                     f"❌ Unable to resolve target sheet for {category}. "
                     f"Expected AMK settlement gid {CK_AMK_SETTLEMENT_GID}.",
                     type="error",
                 )
-                return {"ok": False, "reason": "target_sheet_not_found", "expected_gid": CK_AMK_SETTLEMENT_GID}
+                return {
+                    "ok": False,
+                    "reason": "target_sheet_not_found",
+                    "expected_gid": CK_AMK_SETTLEMENT_GID,
+                    "debug": " > ".join(sync_debug),
+                }
+            sync_debug.append(f"target_sheet:{target_sheet.title}|gid:{target_sheet.id}|cell:{cell_ref}")
             state_cell_ref = f"CK_AMK:{cell_ref}" if category == "CK" else cell_ref
             db = SessionLocal()
             state = db.query(SheetState).filter(SheetState.cell_reference == state_cell_ref).first()
@@ -379,15 +396,29 @@ def update_google_sheet(amount, category, filename, record_id=None):
             if category == "CK":
                 # CK flow requirement: write extracted total_amount directly into C39.
                 final_amount = format_amount(parse_amount(amount))
+            sync_debug.append(f"final_amount:{final_amount}")
 
             # Perform update
+            sync_debug.append("write_cell")
             call_with_quota_retry(lambda: target_sheet.update_acell(cell_ref, final_amount))
             # Read back to ensure the update actually landed on the intended sheet/cell.
+            sync_debug.append("readback_cell")
             readback_val = call_with_quota_retry(lambda: target_sheet.acell(cell_ref).value or "0")
             readback_amount = format_amount(parse_amount(readback_val))
             expected_amount = format_amount(parse_amount(final_amount))
             if readback_amount != expected_amount:
                 db.close()
+                logger.error(
+                    "Sheet verification mismatch | category=%s sheet=%s gid=%s cell=%s expected=%s found=%s raw=%s debug=%s",
+                    category,
+                    target_sheet.title,
+                    target_sheet.id,
+                    cell_ref,
+                    expected_amount,
+                    readback_amount,
+                    readback_val,
+                    " > ".join(sync_debug),
+                )
                 log_to_ui(
                     f"❌ Sheet verification mismatch on {target_sheet.title}!{cell_ref} (gid: {target_sheet.id}). "
                     f"Expected ${expected_amount}, but found ${readback_amount} (raw: {readback_val}).",
@@ -402,9 +433,11 @@ def update_google_sheet(amount, category, filename, record_id=None):
                     "value": readback_amount,
                     "expected": expected_amount,
                     "raw": str(readback_val),
+                    "debug": " > ".join(sync_debug),
                 }
 
             # Audit log
+            sync_debug.append("write_audit")
             if not state:
                 state = SheetState(cell_reference=state_cell_ref, last_value=str(final_amount), last_updated=datetime.utcnow())
                 db.add(state)
@@ -423,10 +456,34 @@ def update_google_sheet(amount, category, filename, record_id=None):
                 log_to_ui(f"✅ Synced CK to AMK settlement ({audit_sheet_name}!{cell_ref}) (${final_amount})", type="success")
             else:
                 log_to_ui(f"✅ Synced {category} to {cell_ref} (${final_amount})", type="success")
-            return {"ok": True, "cell": cell_ref, "sheet_title": audit_sheet_name, "gid": target_sheet.id, "value": expected_amount}
+            logger.info(
+                "Sheet sync success | category=%s sheet=%s gid=%s cell=%s value=%s debug=%s",
+                category,
+                audit_sheet_name,
+                target_sheet.id,
+                cell_ref,
+                expected_amount,
+                " > ".join(sync_debug),
+            )
+            return {
+                "ok": True,
+                "cell": cell_ref,
+                "sheet_title": audit_sheet_name,
+                "gid": target_sheet.id,
+                "value": expected_amount,
+                "debug": " > ".join(sync_debug),
+            }
     except Exception as e:
+        logger.exception(
+            "Sheet sync error | category=%s filename=%s amount=%s debug=%s",
+            category,
+            filename,
+            amount,
+            " > ".join(sync_debug),
+        )
         log_to_ui(f"❌ Sheet Sync Error: {e}", type="error")
-    return {"ok": False}
+        return {"ok": False, "reason": "exception", "error": str(e), "debug": " > ".join(sync_debug)}
+    return {"ok": False, "reason": "unknown", "debug": " > ".join(sync_debug)}
 
 def save_to_db(filename, data, category):
     db = SessionLocal()
@@ -795,6 +852,7 @@ with tab1:
                                 f"(gid: {sync_result.get('gid', CK_AMK_SETTLEMENT_GID)}) "
                                 f"-> ${sync_result.get('value', '0.00')}"
                             )
+                            preview["sync_debug"] = sync_result.get("debug", "")
                         else:
                             preview["auto_status"] = (
                                 "Saved to CK, but sheet sync verification failed. "
@@ -802,8 +860,11 @@ with tab1:
                                 f"found ${sync_result.get('value', 'unknown')} "
                                 f"at {sync_result.get('sheet_title', 'AMK settlement')} "
                                 f"{sync_result.get('cell', 'C39')} "
-                                f"(gid: {sync_result.get('gid', CK_AMK_SETTLEMENT_GID)})."
+                                f"(gid: {sync_result.get('gid', CK_AMK_SETTLEMENT_GID)}). "
+                                f"Reason: {sync_result.get('reason', 'unknown')}. "
+                                f"Error: {sync_result.get('error', 'n/a')}."
                             )
+                            preview["sync_debug"] = sync_result.get("debug", "")
                     else:
                         preview["auto_status"] = "Saved failed: CK row not found after insert"
                 else:
@@ -819,6 +880,8 @@ with tab1:
             st.caption(f"Detected Category: {preview['category']}")
             if preview.get("auto_status"):
                 st.caption(f"Status: {preview['auto_status']}")
+            if preview.get("sync_debug"):
+                st.caption(f"Sync debug: {preview['sync_debug']}")
             st.json(preview["data"])
             with st.expander("📄 Raw OCR Text"):
                 st.text(preview["text"])
