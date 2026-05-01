@@ -398,7 +398,8 @@ def background_polling_loop():
         time.sleep(SHEET_POLL_INTERVAL_SECONDS)
 
 def sync_sheet_changes_once():
-    cells = ["C39", "C42"]
+    # AMK settlement sheet manual listener (CK/SP/FWL).
+    cells = ["C39", "C42", "C67"]
     db = None
     try:
         client = get_gsheet_client()
@@ -436,14 +437,21 @@ def sync_sheet_changes_once():
                 elif cell_ref == "C42":
                     entry = SPTable(filename="Manual Entry", total_amount=normalized_current_val, remarks="Manual edit in Sheet", timestamp=datetime.utcnow())
                     db.add(entry); db.flush(); source_table, source_id = "SP", entry.id
+                elif cell_ref == "C67":
+                    entry = FWLTable(
+                        filename="Manual Entry",
+                        clinic_name="AMK",
+                        total_payable=normalized_current_val,
+                        remarks="Manual edit in Sheet (C67)",
+                        timestamp=datetime.utcnow(),
+                    )
+                    db.add(entry); db.flush(); source_table, source_id = "FWL", entry.id
                 audit = CellChange(sheet_name="Settlement", cell_reference=cell_ref, label_name=str(label_val), old_value=normalized_last_logged_val, new_value=normalized_current_val, source_table=source_table, source_id=source_id, timestamp=datetime.utcnow())
                 state.last_value = normalized_current_val
                 state.last_updated = datetime.utcnow()
                 db.add(audit); db.commit()
                 
                 logger.info(f"SUCCESS: Recorded manual change in {cell_ref} as {normalized_current_val}")
-
-        # FWL manual polling removed by request.
     except Exception as e:
         logger.error(f"Polling error: {e}")
     finally:
