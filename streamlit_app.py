@@ -77,9 +77,9 @@ FWL_CLINIC_WORKSHEET_KEY = {
     "BOON KENG / BK": "BOON KENG",
 }
 FWL_SETTLEMENT_CELL = "C67"
-SHEET_POLL_INTERVAL_SECONDS = 120
-FOREGROUND_SYNC_COOLDOWN_SECONDS = 120
-SHEET_POLLING_ENABLED = os.environ.get("ENABLE_SHEET_POLLING", "false").strip().lower() == "true"
+SHEET_POLL_INTERVAL_SECONDS = 5
+FOREGROUND_SYNC_COOLDOWN_SECONDS = 5
+SHEET_POLLING_ENABLED = os.environ.get("ENABLE_SHEET_POLLING", "true").strip().lower() == "true"
 
 def _load_service_account_info():
     # 1) Streamlit Cloud secrets.toml
@@ -650,7 +650,8 @@ def sync_sheet_changes_once():
     try:
         client = get_gsheet_client()
         spreadsheet = client.open_by_key(SHEET_ID)
-        settlement = spreadsheet.get_worksheet_by_id(SETTLEMENT_GID)
+        # Listen specifically on AMK settlement worksheet.
+        settlement = spreadsheet.get_worksheet_by_id(CK_AMK_SETTLEMENT_GID)
         db = SessionLocal()
 
         current_values = get_cell_values_map(settlement, cells)
