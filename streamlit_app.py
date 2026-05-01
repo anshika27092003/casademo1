@@ -51,25 +51,25 @@ SP_EXTRACTED_FIELDS = [
 
 # FWL: user picks clinic; amount appends to C67 on that clinic's settlement worksheet.
 FWL_CLINICS = [
-    "ADMIRALTY",
     "AMK",
-    "BATOK",
-    "CLEMENTI",
     "HOLLAND",
-    "JURONG",
-    "KAMPUNG",
-    "TAMPINES",
+    "WOODLANDS / WDLS",
+    "BUKIT BATOK / BB",
+    "BEDOK",
+    "ADMIRALTY / ADM",
+    "TENGAH",
+    "BOON KENG / BK",
 ]
 # Map dropdown label -> substring that appears in the Google Sheet tab title (upper match).
 FWL_CLINIC_WORKSHEET_KEY = {
-    "ADMIRALTY": "ADM",
     "AMK": "AMK",
-    "BATOK": "BEDOK",
-    "CLEMENTI": "CLEMENTI",
     "HOLLAND": "HOLLAND",
-    "JURONG": "JURONG",
-    "KAMPUNG": "KAMPUNG",
-    "TAMPINES": "TAMPINES",
+    "WOODLANDS / WDLS": "WDLS",
+    "BUKIT BATOK / BB": "BB",
+    "BEDOK": "BEDOK",
+    "ADMIRALTY / ADM": "ADM",
+    "TENGAH": "TENGAH",
+    "BOON KENG / BK": "BOON KENG",
 }
 FWL_SETTLEMENT_CELL = "C67"
 SHEET_POLL_INTERVAL_SECONDS = 60
