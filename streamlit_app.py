@@ -72,6 +72,9 @@ FWL_CLINIC_WORKSHEET_KEY = {
     "TAMPINES": "TAMPINES",
 }
 FWL_SETTLEMENT_CELL = "C67"
+SHEET_POLL_INTERVAL_SECONDS = 60
+FOREGROUND_SYNC_COOLDOWN_SECONDS = 45
+ENABLE_FWL_MANUAL_SCAN = False
 
 def _load_service_account_info():
     try:
@@ -158,6 +161,9 @@ def update_fwl_sheet_for_clinic(clinic_label, amount_to_append, filename, record
         db.close()
         log_to_ui(f"✅ Synced FWL for {clinic_label} → {settlement_ws.title}!{cell_ref} (${final_amount})", type="success")
     except Exception as e:
+        if is_read_quota_error(e):
+            logger.warning(f"FWL read quota hit (hidden from UI): {e}")
+            return
         log_to_ui(f"❌ FWL Sheet Sync Error: {e}", type="error")
 
 def normalize_ck_payload(filename, data):
@@ -223,6 +229,40 @@ def parse_amount(value):
 
 def format_amount(value):
     return f"{float(value):.2f}"
+
+def is_read_quota_error(err: Exception) -> bool:
+    msg = str(err).lower()
+    return (
+        "quota exceeded" in msg
+        or "read requests per minute per user" in msg
+        or "apierror: [429]" in msg
+        or "429" in msg
+    )
+
+
+def get_cell_values_map(worksheet, cells):
+    """Fetch multiple cells with one API call when possible."""
+    try:
+        values = worksheet.batch_get(cells)
+        cell_map = {}
+        for idx, cell_ref in enumerate(cells):
+            raw = values[idx] if idx < len(values) else []
+            if raw and isinstance(raw, list):
+                first_row = raw[0] if len(raw) > 0 else []
+                if isinstance(first_row, list):
+                    val = first_row[0] if first_row else "0"
+                else:
+                    val = first_row
+            else:
+                val = "0"
+            cell_map[cell_ref] = format_amount(parse_amount(val))
+        return cell_map
+    except Exception:
+        # Fallback for API differences/older gspread behavior.
+        return {
+            c: format_amount(parse_amount(worksheet.acell(c).value or "0"))
+            for c in cells
+        }
 
 def is_duplicate_manual_change(db: Session, cell_ref: str, new_val: str) -> bool:
     """Guard against duplicate inserts for the same manual sheet edit."""
@@ -335,10 +375,10 @@ def get_tracker_manager():
 def background_polling_loop():
     logger.info("Background tracker started.")
     while True:
-        sync_sheet_changes_once()
-        time.sleep(15)
+        sync_sheet_changes_once(include_fwl_manual_scan=ENABLE_FWL_MANUAL_SCAN)
+        time.sleep(SHEET_POLL_INTERVAL_SECONDS)
 
-def sync_sheet_changes_once():
+def sync_sheet_changes_once(include_fwl_manual_scan=False):
     cells = ["C39", "C42"]
     db = None
     try:
@@ -347,8 +387,9 @@ def sync_sheet_changes_once():
         settlement = spreadsheet.get_worksheet_by_id(SETTLEMENT_GID)
         db = SessionLocal()
 
+        current_values = get_cell_values_map(settlement, cells)
         for cell_ref in cells:
-            current_val = format_amount(parse_amount(settlement.acell(cell_ref).value or "0"))
+            current_val = current_values[cell_ref]
             state = db.query(SheetState).filter(SheetState.cell_reference == cell_ref).first()
             if not state:
                 db.add(SheetState(cell_reference=cell_ref, last_value=current_val, last_updated=datetime.utcnow()))
@@ -383,52 +424,53 @@ def sync_sheet_changes_once():
                 
                 logger.info(f"SUCCESS: Recorded manual change in {cell_ref} as {normalized_current_val}")
 
-        # FWL: each clinic tab has its own C67 — track manual edits per tab.
-        for clinic_label in FWL_CLINICS:
-            fwl_ws = resolve_fwl_worksheet(spreadsheet, clinic_label)
-            if not fwl_ws:
-                continue
-            cell_ref = FWL_SETTLEMENT_CELL
-            state_key = fwl_sheet_state_key(fwl_ws.title)
-            current_val = format_amount(parse_amount(fwl_ws.acell(cell_ref).value or "0"))
-            state = db.query(SheetState).filter(SheetState.cell_reference == state_key).first()
-            if not state:
-                db.add(SheetState(cell_reference=state_key, last_value=current_val, last_updated=datetime.utcnow()))
-                db.commit()
-                continue
-            last_logged_val = format_amount(parse_amount(state.last_value))
-            if current_val != last_logged_val:
-                row_num = re.findall(r"\d+", cell_ref)[0]
-                label_val = fwl_ws.acell(f"A{row_num}").value
-                if is_duplicate_manual_change(db, state_key, current_val):
-                    state.last_value = current_val
-                    state.last_updated = datetime.utcnow()
+        if include_fwl_manual_scan:
+            # FWL: each clinic tab has its own C67 — optional (costly) scan.
+            for clinic_label in FWL_CLINICS:
+                fwl_ws = resolve_fwl_worksheet(spreadsheet, clinic_label)
+                if not fwl_ws:
+                    continue
+                cell_ref = FWL_SETTLEMENT_CELL
+                state_key = fwl_sheet_state_key(fwl_ws.title)
+                current_val = format_amount(parse_amount(fwl_ws.acell(cell_ref).value or "0"))
+                state = db.query(SheetState).filter(SheetState.cell_reference == state_key).first()
+                if not state:
+                    db.add(SheetState(cell_reference=state_key, last_value=current_val, last_updated=datetime.utcnow()))
                     db.commit()
                     continue
-                entry = FWLTable(
-                    filename="Manual Entry",
-                    clinic_name=clinic_label,
-                    total_payable=current_val,
-                    remarks="Manual edit in Sheet",
-                    timestamp=datetime.utcnow(),
-                )
-                db.add(entry)
-                db.flush()
-                audit = CellChange(
-                    sheet_name=fwl_ws.title,
-                    cell_reference=state_key,
-                    label_name=str(label_val),
-                    old_value=last_logged_val,
-                    new_value=current_val,
-                    source_table="FWL",
-                    source_id=entry.id,
-                    timestamp=datetime.utcnow(),
-                )
-                state.last_value = current_val
-                state.last_updated = datetime.utcnow()
-                db.add(audit)
-                db.commit()
-                logger.info(f"SUCCESS: Recorded FWL manual change {fwl_ws.title} {cell_ref} as {current_val}")
+                last_logged_val = format_amount(parse_amount(state.last_value))
+                if current_val != last_logged_val:
+                    row_num = re.findall(r"\d+", cell_ref)[0]
+                    label_val = fwl_ws.acell(f"A{row_num}").value
+                    if is_duplicate_manual_change(db, state_key, current_val):
+                        state.last_value = current_val
+                        state.last_updated = datetime.utcnow()
+                        db.commit()
+                        continue
+                    entry = FWLTable(
+                        filename="Manual Entry",
+                        clinic_name=clinic_label,
+                        total_payable=current_val,
+                        remarks="Manual edit in Sheet",
+                        timestamp=datetime.utcnow(),
+                    )
+                    db.add(entry)
+                    db.flush()
+                    audit = CellChange(
+                        sheet_name=fwl_ws.title,
+                        cell_reference=state_key,
+                        label_name=str(label_val),
+                        old_value=last_logged_val,
+                        new_value=current_val,
+                        source_table="FWL",
+                        source_id=entry.id,
+                        timestamp=datetime.utcnow(),
+                    )
+                    state.last_value = current_val
+                    state.last_updated = datetime.utcnow()
+                    db.add(audit)
+                    db.commit()
+                    logger.info(f"SUCCESS: Recorded FWL manual change {fwl_ws.title} {cell_ref} as {current_val}")
     except Exception as e:
         logger.error(f"Polling error: {e}")
     finally:
@@ -593,9 +635,12 @@ with st.sidebar:
         st.rerun()
 
 Base.metadata.create_all(bind=engine)
-# Run one foreground sync each rerun so manual sheet edits are visible without
-# relying only on background thread scheduling.
-sync_sheet_changes_once()
+# Foreground sync is throttled to avoid hitting Sheets read quotas.
+now_ts = time.time()
+last_sync_ts = st.session_state.get("last_foreground_sheet_sync_ts", 0.0)
+if now_ts - last_sync_ts >= FOREGROUND_SYNC_COOLDOWN_SECONDS:
+    sync_sheet_changes_once(include_fwl_manual_scan=False)
+    st.session_state["last_foreground_sheet_sync_ts"] = now_ts
 start_background_tracker()
 
 tab1, tab2 = st.tabs(["📤 Upload Documents (OCR)", "📋 View Records"])
