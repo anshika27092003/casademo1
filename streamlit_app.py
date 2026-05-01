@@ -239,9 +239,6 @@ def update_fwl_sheet_for_clinic(clinic_label, amount_to_append, filename, record
             type="success",
         )
     except Exception as e:
-        if is_read_quota_error(e):
-            logger.warning(f"FWL read quota hit (hidden from UI): {e}")
-            return
         log_to_ui(f"❌ FWL Sheet Sync Error: {e}", type="error")
 
 def normalize_ck_payload(filename, data):
