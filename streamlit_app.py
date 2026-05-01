@@ -198,7 +198,7 @@ def update_amk_cell_direct(cell_ref, final_amount):
 
 
 def update_fwl_sheet_for_clinic(clinic_label, amount_to_append, filename, record_id=None):
-    """Append FWL total_payable to selected clinic settlement C67."""
+    """Write FWL total_payable to selected clinic settlement C67."""
     try:
         client = get_gsheet_client()
         spreadsheet = call_with_quota_retry(lambda: client.open_by_key(SHEET_ID), max_attempts=5, base_sleep=1.2)
@@ -208,26 +208,24 @@ def update_fwl_sheet_for_clinic(clinic_label, amount_to_append, filename, record
             return
 
         cell_ref = FWL_SETTLEMENT_CELL
-        append_amount = format_amount(parse_amount(amount_to_append))
-        # Use formula write to avoid a separate read request before append.
-        formula = f"=N({cell_ref})+{append_amount}"
-        call_with_quota_retry(lambda: settlement_ws.update_acell(cell_ref, formula), max_attempts=5, base_sleep=1.2)
+        write_amount = format_amount(parse_amount(amount_to_append))
+        call_with_quota_retry(lambda: settlement_ws.update_acell(cell_ref, write_amount), max_attempts=5, base_sleep=1.2)
 
         state_key = f"FWL|{settlement_ws.title}|{cell_ref}"
         db = SessionLocal()
         state = db.query(SheetState).filter(SheetState.cell_reference == state_key).first()
         if not state:
-            state = SheetState(cell_reference=state_key, last_value=str(append_amount), last_updated=datetime.utcnow())
+            state = SheetState(cell_reference=state_key, last_value=str(write_amount), last_updated=datetime.utcnow())
             db.add(state)
         else:
-            state.last_value = str(append_amount)
+            state.last_value = str(write_amount)
             state.last_updated = datetime.utcnow()
         audit = CellChange(
             sheet_name=settlement_ws.title,
             cell_reference=state_key,
             label_name=clinic_label,
             old_value="FWL Upload",
-            new_value=str(append_amount),
+            new_value=str(write_amount),
             source_table="FWL",
             source_id=record_id,
             timestamp=datetime.utcnow(),
@@ -236,7 +234,7 @@ def update_fwl_sheet_for_clinic(clinic_label, amount_to_append, filename, record
         db.commit()
         db.close()
         log_to_ui(
-            f"✅ Synced FWL to {clinic_label} settlement ({settlement_ws.title}!{cell_ref}) (+${append_amount})",
+            f"✅ Synced FWL to {clinic_label} settlement ({settlement_ws.title}!{cell_ref}) (${write_amount})",
             type="success",
         )
     except Exception as e:
@@ -1058,7 +1056,7 @@ with tab1:
                     )
                     st.success(
                         f"Submitted {submitted_count} FWL record(s) for {fwl_clinic}. "
-                        f"Appended ${format_amount(fwl_batch_total)} to {FWL_SETTLEMENT_CELL} on selected clinic sheet."
+                        f"Wrote ${format_amount(fwl_batch_total)} to {FWL_SETTLEMENT_CELL} on selected clinic sheet."
                     )
                     if failed_files:
                         st.warning(
