@@ -149,6 +149,20 @@ def resolve_fwl_worksheet(spreadsheet, clinic_label):
     return None
 
 
+def resolve_ck_amk_worksheet(spreadsheet):
+    """Resolve CK AMK settlement tab with gid-first and title fallback."""
+    try:
+        return spreadsheet.get_worksheet_by_id(CK_AMK_SETTLEMENT_GID)
+    except Exception:
+        pass
+
+    for ws in spreadsheet.worksheets():
+        title_u = (ws.title or "").upper()
+        if "AMK" in title_u and "SETTLEMENT" in title_u:
+            return ws
+    return None
+
+
 def update_fwl_sheet_for_clinic(clinic_label, amount_to_append, filename, record_id=None):
     """Append FWL total_payable to C67 on the clinic-specific settlement tab."""
     try:
@@ -344,13 +358,20 @@ def update_google_sheet(amount, category, filename, record_id=None):
         client = get_gsheet_client()
         spreadsheet = client.open_by_key(SHEET_ID)
         settlement = spreadsheet.get_worksheet_by_id(SETTLEMENT_GID)
-        ck_settlement = spreadsheet.get_worksheet_by_id(CK_AMK_SETTLEMENT_GID)
+        ck_settlement = resolve_ck_amk_worksheet(spreadsheet)
 
         cell_map = {"CK": "C39", "SP": "C42"}
         cell_ref = cell_map.get(category)
 
         if cell_ref:
             target_sheet = ck_settlement if category == "CK" else settlement
+            if target_sheet is None:
+                log_to_ui(
+                    f"❌ Unable to resolve target sheet for {category}. "
+                    f"Expected AMK settlement gid {CK_AMK_SETTLEMENT_GID}.",
+                    type="error",
+                )
+                return {"ok": False, "reason": "target_sheet_not_found", "expected_gid": CK_AMK_SETTLEMENT_GID}
             state_cell_ref = f"CK_AMK:{cell_ref}" if category == "CK" else cell_ref
             db = SessionLocal()
             state = db.query(SheetState).filter(SheetState.cell_reference == state_cell_ref).first()
@@ -369,10 +390,19 @@ def update_google_sheet(amount, category, filename, record_id=None):
                 db.close()
                 log_to_ui(
                     f"❌ Sheet verification mismatch on {target_sheet.title}!{cell_ref} (gid: {target_sheet.id}). "
-                    f"Expected ${expected_amount}, but found ${readback_amount}.",
+                    f"Expected ${expected_amount}, but found ${readback_amount} (raw: {readback_val}).",
                     type="error",
                 )
-                return {"ok": False, "cell": cell_ref, "sheet_title": target_sheet.title, "gid": target_sheet.id, "value": readback_amount}
+                return {
+                    "ok": False,
+                    "reason": "verification_mismatch",
+                    "cell": cell_ref,
+                    "sheet_title": target_sheet.title,
+                    "gid": target_sheet.id,
+                    "value": readback_amount,
+                    "expected": expected_amount,
+                    "raw": str(readback_val),
+                }
 
             # Audit log
             if not state:
@@ -768,7 +798,11 @@ with tab1:
                         else:
                             preview["auto_status"] = (
                                 "Saved to CK, but sheet sync verification failed. "
-                                f"Please check AMK settlement C39 (gid: {CK_AMK_SETTLEMENT_GID})."
+                                f"Expected ${sync_result.get('expected', preview['data'].get('total_amount', '0.00'))}, "
+                                f"found ${sync_result.get('value', 'unknown')} "
+                                f"at {sync_result.get('sheet_title', 'AMK settlement')} "
+                                f"{sync_result.get('cell', 'C39')} "
+                                f"(gid: {sync_result.get('gid', CK_AMK_SETTLEMENT_GID)})."
                             )
                     else:
                         preview["auto_status"] = "Saved failed: CK row not found after insert"
