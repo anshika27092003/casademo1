@@ -73,8 +73,9 @@ FWL_CLINIC_WORKSHEET_KEY = {
     "BOON KENG / BK": "BOON KENG",
 }
 FWL_SETTLEMENT_CELL = "C67"
-SHEET_POLL_INTERVAL_SECONDS = 5
-FOREGROUND_SYNC_COOLDOWN_SECONDS = 5
+SHEET_POLL_INTERVAL_SECONDS = 120
+FOREGROUND_SYNC_COOLDOWN_SECONDS = 120
+SHEET_POLLING_ENABLED = os.environ.get("ENABLE_SHEET_POLLING", "false").strip().lower() == "true"
 
 def _load_service_account_info():
     # 1) Streamlit Cloud secrets.toml
@@ -364,9 +365,9 @@ def update_google_sheet(amount, category, filename, record_id=None):
         sync_debug.append("init_client")
         client = get_gsheet_client()
         sync_debug.append("open_spreadsheet")
-        spreadsheet = client.open_by_key(SHEET_ID)
+        spreadsheet = call_with_quota_retry(lambda: client.open_by_key(SHEET_ID), max_attempts=5, base_sleep=1.2)
         sync_debug.append(f"load_default_settlement_gid:{SETTLEMENT_GID}")
-        settlement = spreadsheet.get_worksheet_by_id(SETTLEMENT_GID)
+        settlement = call_with_quota_retry(lambda: spreadsheet.get_worksheet_by_id(SETTLEMENT_GID), max_attempts=5, base_sleep=1.2)
         sync_debug.append(f"resolve_ck_target_gid:{CK_AMK_SETTLEMENT_GID}")
         ck_settlement = resolve_ck_amk_worksheet(spreadsheet)
 
@@ -408,7 +409,31 @@ def update_google_sheet(amount, category, filename, record_id=None):
             call_with_quota_retry(lambda: target_sheet.update_acell(cell_ref, final_amount))
             # Read back to ensure the update actually landed on the intended sheet/cell.
             sync_debug.append("readback_cell")
-            readback_val = call_with_quota_retry(lambda: target_sheet.acell(cell_ref).value or "0")
+            try:
+                readback_val = call_with_quota_retry(lambda: target_sheet.acell(cell_ref).value or "0")
+            except Exception as readback_err:
+                if is_read_quota_error(readback_err):
+                    # Write likely succeeded, but verification read is throttled.
+                    logger.warning(
+                        "Sheet readback deferred due quota | category=%s sheet=%s gid=%s cell=%s value=%s debug=%s",
+                        category,
+                        target_sheet.title,
+                        target_sheet.id,
+                        cell_ref,
+                        final_amount,
+                        " > ".join(sync_debug),
+                    )
+                    db.close()
+                    return {
+                        "ok": True,
+                        "verification_deferred": True,
+                        "cell": cell_ref,
+                        "sheet_title": target_sheet.title,
+                        "gid": target_sheet.id,
+                        "value": format_amount(parse_amount(final_amount)),
+                        "debug": " > ".join(sync_debug) + " > readback_deferred_quota",
+                    }
+                raise
             readback_amount = format_amount(parse_amount(readback_val))
             expected_amount = format_amount(parse_amount(final_amount))
             if readback_amount != expected_amount:
@@ -763,12 +788,13 @@ with st.sidebar:
 
 Base.metadata.create_all(bind=engine)
 # Foreground sync is throttled to avoid hitting Sheets read quotas.
-now_ts = time.time()
-last_sync_ts = st.session_state.get("last_foreground_sheet_sync_ts", 0.0)
-if now_ts - last_sync_ts >= FOREGROUND_SYNC_COOLDOWN_SECONDS:
-    sync_sheet_changes_once()
-    st.session_state["last_foreground_sheet_sync_ts"] = now_ts
-start_background_tracker()
+if SHEET_POLLING_ENABLED:
+    now_ts = time.time()
+    last_sync_ts = st.session_state.get("last_foreground_sheet_sync_ts", 0.0)
+    if now_ts - last_sync_ts >= FOREGROUND_SYNC_COOLDOWN_SECONDS:
+        sync_sheet_changes_once()
+        st.session_state["last_foreground_sheet_sync_ts"] = now_ts
+    start_background_tracker()
 
 tab1, tab2 = st.tabs(["📤 Upload Documents (OCR)", "📋 View Records"])
 
@@ -850,13 +876,22 @@ with tab1:
                         sync_result = update_google_sheet(ck_row.total_amount, "CK", preview["filename"], rid)
                         if sync_result and sync_result.get("ok"):
                             st.session_state['auto_processed_ck'].add(file_key)
-                            preview["auto_status"] = (
-                                "Saved to CK and wrote extracted total to "
-                                f"{sync_result.get('sheet_title', 'AMK settlement')} "
-                                f"{sync_result.get('cell', 'C39')} "
-                                f"(gid: {sync_result.get('gid', CK_AMK_SETTLEMENT_GID)}) "
-                                f"-> ${sync_result.get('value', '0.00')}"
-                            )
+                            if sync_result.get("verification_deferred"):
+                                preview["auto_status"] = (
+                                    "Saved to CK and wrote extracted total to "
+                                    f"{sync_result.get('sheet_title', 'AMK settlement')} "
+                                    f"{sync_result.get('cell', 'C39')} "
+                                    f"(gid: {sync_result.get('gid', CK_AMK_SETTLEMENT_GID)}). "
+                                    "Verification read was deferred due Google Sheets read quota."
+                                )
+                            else:
+                                preview["auto_status"] = (
+                                    "Saved to CK and wrote extracted total to "
+                                    f"{sync_result.get('sheet_title', 'AMK settlement')} "
+                                    f"{sync_result.get('cell', 'C39')} "
+                                    f"(gid: {sync_result.get('gid', CK_AMK_SETTLEMENT_GID)}) "
+                                    f"-> ${sync_result.get('value', '0.00')}"
+                                )
                             preview["sync_debug"] = sync_result.get("debug", "")
                         else:
                             preview["auto_status"] = (
