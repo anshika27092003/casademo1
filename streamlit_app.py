@@ -257,6 +257,20 @@ def is_read_quota_error(err: Exception) -> bool:
         or "429" in msg
     )
 
+def call_with_quota_retry(fn, max_attempts=3, base_sleep=0.8):
+    """Retry quota-throttled Google Sheet calls with small backoff."""
+    last_err = None
+    for attempt in range(max_attempts):
+        try:
+            return fn()
+        except Exception as e:
+            last_err = e
+            if not is_read_quota_error(e):
+                raise
+            time.sleep(base_sleep * (attempt + 1))
+    if last_err:
+        raise last_err
+
 
 def get_cell_values_map(worksheet, cells):
     """Fetch multiple cells with one API call when possible."""
@@ -306,17 +320,23 @@ def update_google_sheet(amount, category, filename, record_id=None):
         cell_ref = cell_map.get(category)
         
         if cell_ref:
-            final_amount = amount
-            if category == "CK":
-                current_val = settlement.acell(cell_ref).value
-                final_amount = format_amount(parse_amount(current_val) + parse_amount(amount))
-            
-            # Perform update
-            settlement.update_acell(cell_ref, final_amount)
-            
-            # Audit log
             db = SessionLocal()
             state = db.query(SheetState).filter(SheetState.cell_reference == cell_ref).first()
+            final_amount = amount
+            if category == "CK":
+                # Prefer DB-tracked state for append baseline to avoid read quota failures.
+                baseline_val = state.last_value if state else "0"
+                if parse_amount(baseline_val) == 0:
+                    try:
+                        baseline_val = call_with_quota_retry(lambda: settlement.acell(cell_ref).value or "0")
+                    except Exception:
+                        baseline_val = "0"
+                final_amount = format_amount(parse_amount(baseline_val) + parse_amount(amount))
+            
+            # Perform update
+            call_with_quota_retry(lambda: settlement.update_acell(cell_ref, final_amount))
+            
+            # Audit log
             if not state:
                 state = SheetState(cell_reference=cell_ref, last_value=str(final_amount), last_updated=datetime.utcnow())
                 db.add(state)
@@ -324,7 +344,10 @@ def update_google_sheet(amount, category, filename, record_id=None):
                 state.last_value = str(final_amount)
                 state.last_updated = datetime.utcnow()
 
-            label_val = settlement.acell(f"A{cell_ref[1:]}").value
+            try:
+                label_val = call_with_quota_retry(lambda: settlement.acell(f"A{cell_ref[1:]}").value or "")
+            except Exception:
+                label_val = ""
             audit = CellChange(sheet_name="Settlement", cell_reference=cell_ref, label_name=str(label_val), old_value="OCR Upload", new_value=str(final_amount), source_table=category, source_id=record_id, timestamp=datetime.utcnow())
             db.add(audit); db.commit(); db.close()
             log_to_ui(f"✅ Synced {category} to {cell_ref} (${final_amount})", type="success")
