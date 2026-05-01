@@ -4,11 +4,14 @@ import os
 import json
 import re
 import time
+import requests
+from urllib.parse import quote
 from datetime import datetime
 from sqlalchemy.orm import Session
 from database import SessionLocal, engine, Base, CKSecreterial, SPTable, FWLTable, CellChange, SyncLock, SheetState
 import gspread
 from google.oauth2.service_account import Credentials
+from google.auth.transport.requests import Request
 import logging
 from sqlalchemy.exc import IntegrityError
 import threading
@@ -25,7 +28,8 @@ def log_to_ui(msg, type="info"):
 # --- GOOGLE SHEETS SETUP ---
 SHEET_ID = "1FLeADEkmIJTJ-8E88lELpiJX1ARoK5D4tjSn2qcsU10"
 SETTLEMENT_GID = 305885354
-CK_AMK_SETTLEMENT_GID = 1365255493
+CK_AMK_SETTLEMENT_GID = 305885354
+CK_AMK_SHEET_TITLE = "AMK SETTLEMENT CALC NEW"
 LOCATION = "us"
 CK_STATIC_COLUMNS = [
     "filename",
@@ -167,6 +171,30 @@ def resolve_ck_amk_worksheet(spreadsheet):
     except Exception:
         logger.exception("Failed resolving CK AMK worksheet by gid=%s", CK_AMK_SETTLEMENT_GID)
     return None
+
+
+def update_ck_amk_c39_direct(final_amount):
+    """Directly write CK amount to AMK C39 via Sheets Values API (no metadata read)."""
+    creds = get_sheet_credentials()
+    creds.refresh(Request())
+    range_name = f"{CK_AMK_SHEET_TITLE}!C39"
+    encoded_range = quote(range_name, safe="")
+    url = f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}/values/{encoded_range}"
+    headers = {
+        "Authorization": f"Bearer {creds.token}",
+        "Content-Type": "application/json",
+    }
+    payload = {"range": range_name, "majorDimension": "ROWS", "values": [[str(final_amount)]]}
+    response = requests.put(
+        url,
+        headers=headers,
+        params={"valueInputOption": "USER_ENTERED"},
+        json=payload,
+        timeout=20,
+    )
+    if response.status_code >= 300:
+        raise Exception(f"HTTP {response.status_code}: {response.text}")
+    return True
 
 
 def update_fwl_sheet_for_clinic(clinic_label, amount_to_append, filename, record_id=None):
@@ -362,6 +390,48 @@ def is_duplicate_manual_change(db: Session, cell_ref: str, new_val: str) -> bool
 def update_google_sheet(amount, category, filename, record_id=None):
     sync_debug = []
     try:
+        if category == "CK":
+            # CK path: avoid open_by_key metadata reads to prevent Sheets read quota failures.
+            sync_debug.append("ck_direct_write_start")
+            final_amount = format_amount(parse_amount(amount))
+            update_ck_amk_c39_direct(final_amount)
+            sync_debug.append("ck_direct_write_done")
+
+            db = SessionLocal()
+            state_cell_ref = "CK_AMK:C39"
+            state = db.query(SheetState).filter(SheetState.cell_reference == state_cell_ref).first()
+            if not state:
+                state = SheetState(cell_reference=state_cell_ref, last_value=str(final_amount), last_updated=datetime.utcnow())
+                db.add(state)
+            else:
+                state.last_value = str(final_amount)
+                state.last_updated = datetime.utcnow()
+            audit = CellChange(
+                sheet_name=CK_AMK_SHEET_TITLE,
+                cell_reference="C39",
+                label_name="CK SECRETARIAL / ACCOUNTS SERVICES",
+                old_value="OCR Upload",
+                new_value=str(final_amount),
+                source_table="CK",
+                source_id=record_id,
+                timestamp=datetime.utcnow(),
+            )
+            db.add(audit)
+            db.commit()
+            db.close()
+            log_to_ui(
+                f"✅ Synced CK to AMK settlement ({CK_AMK_SHEET_TITLE}!C39, gid: {CK_AMK_SETTLEMENT_GID}) (${final_amount})",
+                type="success",
+            )
+            return {
+                "ok": True,
+                "cell": "C39",
+                "sheet_title": CK_AMK_SHEET_TITLE,
+                "gid": CK_AMK_SETTLEMENT_GID,
+                "value": final_amount,
+                "debug": " > ".join(sync_debug),
+            }
+
         sync_debug.append("init_client")
         client = get_gsheet_client()
         sync_debug.append("open_spreadsheet")
