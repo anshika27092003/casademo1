@@ -903,4 +903,19 @@ with tab2:
     db = SessionLocal()
     logs = db.query(CellChange).order_by(CellChange.timestamp.desc()).all()
     db.close()
-    if logs: st.dataframe(pd.DataFrame([{"Cell": l.cell_reference, "Old": l.old_value, "New": l.new_value, "Time": l.timestamp.strftime("%H:%M:%S")} for l in logs]), use_container_width=True)
+    if logs:
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "Category": l.source_table or "Unknown",
+                        "Cell": l.cell_reference,
+                        "Old": l.old_value,
+                        "New": l.new_value,
+                        "Timestamp": l.timestamp.strftime("%Y-%m-%d %H:%M:%S") if l.timestamp else "",
+                    }
+                    for l in logs
+                ]
+            ),
+            use_container_width=True,
+        )
