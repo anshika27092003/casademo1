@@ -198,13 +198,21 @@ def update_amk_cell_direct(cell_ref, final_amount):
 
 
 def update_fwl_sheet_for_clinic(clinic_label, amount_to_append, filename, record_id=None):
-    """Write FWL total_payable to AMK settlement C67 directly."""
+    """Append FWL total_payable to selected clinic settlement C67."""
     try:
-        cell_ref = FWL_SETTLEMENT_CELL
-        final_amount = format_amount(parse_amount(amount_to_append))
-        update_amk_cell_direct(cell_ref, final_amount)
+        client = get_gsheet_client()
+        spreadsheet = call_with_quota_retry(lambda: client.open_by_key(SHEET_ID), max_attempts=5, base_sleep=1.2)
+        settlement_ws = resolve_fwl_worksheet(spreadsheet, clinic_label)
+        if not settlement_ws:
+            log_to_ui(f"❌ No settlement worksheet found for clinic: {clinic_label}", type="error")
+            return
 
-        state_key = f"AMK:{cell_ref}:FWL"
+        cell_ref = FWL_SETTLEMENT_CELL
+        current_val = call_with_quota_retry(lambda: settlement_ws.acell(cell_ref).value or "0", max_attempts=5, base_sleep=1.2)
+        final_amount = format_amount(parse_amount(current_val) + parse_amount(amount_to_append))
+        call_with_quota_retry(lambda: settlement_ws.update_acell(cell_ref, final_amount), max_attempts=5, base_sleep=1.2)
+
+        state_key = f"FWL|{settlement_ws.title}|{cell_ref}"
         db = SessionLocal()
         state = db.query(SheetState).filter(SheetState.cell_reference == state_key).first()
         if not state:
@@ -214,9 +222,9 @@ def update_fwl_sheet_for_clinic(clinic_label, amount_to_append, filename, record
             state.last_value = str(final_amount)
             state.last_updated = datetime.utcnow()
         audit = CellChange(
-            sheet_name=CK_AMK_SHEET_TITLE,
+            sheet_name=settlement_ws.title,
             cell_reference=state_key,
-            label_name="FWL",
+            label_name=clinic_label,
             old_value="FWL Upload",
             new_value=str(final_amount),
             source_table="FWL",
@@ -227,7 +235,7 @@ def update_fwl_sheet_for_clinic(clinic_label, amount_to_append, filename, record
         db.commit()
         db.close()
         log_to_ui(
-            f"✅ Synced FWL to AMK settlement ({CK_AMK_SHEET_TITLE}!{cell_ref}, gid: {CK_AMK_SETTLEMENT_GID}) (${final_amount})",
+            f"✅ Synced FWL to {clinic_label} settlement ({settlement_ws.title}!{cell_ref}) (${final_amount})",
             type="success",
         )
     except Exception as e:
@@ -1019,14 +1027,19 @@ with tab1:
             if v.get("category") == "FWL" and v.get("data") and k not in st.session_state['processed_fwl_batch']
         ]
         if fwl_candidates:
-            st.info(f"FWL ready for batch submit: {len(fwl_candidates)} file(s). Target: AMK C67.")
-            if st.button("✅ Submit FWL Batch"):
+            st.info(f"FWL ready for batch submit: {len(fwl_candidates)} file(s). Select clinic before submit.")
+            fwl_clinic = st.selectbox("Clinic for FWL upload(s)", FWL_CLINICS, key="fwl_batch_clinic")
+            fwl_confirm = st.checkbox(
+                f"I confirm uploading these FWL document(s) for clinic: **{fwl_clinic}**",
+                key="fwl_batch_confirm",
+            )
+            if st.button("✅ Submit FWL Batch", disabled=not fwl_confirm):
                 fwl_batch_total = 0.0
                 submitted_count = 0
                 last_rid = None
                 failed_files = []
                 for file_key, preview in fwl_candidates:
-                    inv = normalize_fwl_payload(preview["data"], clinic_name="AMK")
+                    inv = normalize_fwl_payload(preview["data"], clinic_name=fwl_clinic)
                     rid = save_to_db(preview["filename"], inv, "FWL")
                     if rid:
                         submitted_count += 1
@@ -1037,15 +1050,14 @@ with tab1:
                         failed_files.append(preview["filename"])
                 if submitted_count > 0:
                     update_fwl_sheet_for_clinic(
-                        "AMK",
+                        fwl_clinic,
                         format_amount(fwl_batch_total),
                         "FWL Batch Submit",
                         last_rid,
                     )
                     st.success(
-                        f"Submitted {submitted_count} FWL record(s). "
-                        f"Wrote ${format_amount(fwl_batch_total)} to AMK settlement {FWL_SETTLEMENT_CELL} "
-                        f"(gid: {CK_AMK_SETTLEMENT_GID})."
+                        f"Submitted {submitted_count} FWL record(s) for {fwl_clinic}. "
+                        f"Appended ${format_amount(fwl_batch_total)} to {FWL_SETTLEMENT_CELL} on selected clinic sheet."
                     )
                     if failed_files:
                         st.warning(
