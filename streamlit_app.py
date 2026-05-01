@@ -432,6 +432,10 @@ def extract_invoice_data(text, filename=""):
                 if f_start and len(line) > 5: f_rem.append(line)
             if f_rem: data['remarks'] = " | ".join(f_rem)
 
+    # Keep SP remarks strictly as extracted description/service items.
+    if category == "SP" and remarks_lines:
+        data["remarks"] = " | ".join(remarks_lines)
+
     return data, category
 
 def process_document(file_content, mime_type):
