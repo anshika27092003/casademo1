@@ -73,6 +73,15 @@ FWL_CLINIC_WORKSHEET_KEY = {
     "BOON KENG / BK": "BOON KENG",
 }
 FWL_SETTLEMENT_CELL = "C67"
+CK_DEFAULT_SETTLEMENT_CELL = "C39"
+CK_CLINIC_SETTLEMENT_TARGETS = {
+    "AMK": CK_DEFAULT_SETTLEMENT_CELL,
+    "ADM": "C69",
+}
+CK_BILL_TO_CLINIC_KEYWORDS = {
+    "ADM": ["ADMIRALTY", "ADM "],
+    "AMK": ["ANG MO KIO", "AMK"],
+}
 SHEET_POLL_INTERVAL_SECONDS = 5
 FOREGROUND_SYNC_COOLDOWN_SECONDS = 5
 
@@ -159,6 +168,33 @@ def resolve_ck_amk_worksheet(spreadsheet):
     for ws in spreadsheet.worksheets():
         title_u = (ws.title or "").upper()
         if "AMK" in title_u and "SETTLEMENT" in title_u:
+            return ws
+    return None
+
+
+def detect_ck_clinic_from_bill_to(bill_to):
+    bill_to_u = (bill_to or "").upper()
+    for clinic, keywords in CK_BILL_TO_CLINIC_KEYWORDS.items():
+        for kw in keywords:
+            if kw in bill_to_u:
+                return clinic
+    return "AMK"
+
+
+def resolve_ck_worksheet(spreadsheet, clinic_code):
+    """Resolve CK clinic settlement worksheet by title keyword, with AMK gid fallback."""
+    clinic_u = (clinic_code or "AMK").upper()
+    if clinic_u == "AMK":
+        ws = resolve_ck_amk_worksheet(spreadsheet)
+        if ws:
+            return ws
+
+    for ws in spreadsheet.worksheets():
+        title_u = (ws.title or "").upper()
+        if clinic_u in title_u and "SETTLEMENT" in title_u:
+            return ws
+    for ws in spreadsheet.worksheets():
+        if clinic_u in (ws.title or "").upper():
             return ws
     return None
 
@@ -353,7 +389,7 @@ def is_duplicate_manual_change(db: Session, cell_ref: str, new_val: str) -> bool
     # If the latest log already has the same target value, skip duplicate logging.
     return str(last_change.new_value).strip() == str(new_val).strip()
 
-def update_google_sheet(amount, category, filename, record_id=None):
+def update_google_sheet(amount, category, filename, record_id=None, bill_to=None):
     sync_debug = []
     try:
         sync_debug.append("init_client")
@@ -362,10 +398,12 @@ def update_google_sheet(amount, category, filename, record_id=None):
         spreadsheet = client.open_by_key(SHEET_ID)
         sync_debug.append(f"load_default_settlement_gid:{SETTLEMENT_GID}")
         settlement = spreadsheet.get_worksheet_by_id(SETTLEMENT_GID)
-        sync_debug.append(f"resolve_ck_target_gid:{CK_AMK_SETTLEMENT_GID}")
-        ck_settlement = resolve_ck_amk_worksheet(spreadsheet)
+        ck_clinic = detect_ck_clinic_from_bill_to(bill_to) if category == "CK" else None
+        ck_cell_ref = CK_CLINIC_SETTLEMENT_TARGETS.get(ck_clinic, CK_DEFAULT_SETTLEMENT_CELL) if category == "CK" else None
+        sync_debug.append(f"resolve_ck_target:{ck_clinic}|cell:{ck_cell_ref}|amk_gid:{CK_AMK_SETTLEMENT_GID}")
+        ck_settlement = resolve_ck_worksheet(spreadsheet, ck_clinic) if category == "CK" else None
 
-        cell_map = {"CK": "C39", "SP": "C42"}
+        cell_map = {"CK": ck_cell_ref or "C39", "SP": "C42"}
         cell_ref = cell_map.get(category)
 
         if cell_ref:
@@ -386,10 +424,12 @@ def update_google_sheet(amount, category, filename, record_id=None):
                     "ok": False,
                     "reason": "target_sheet_not_found",
                     "expected_gid": CK_AMK_SETTLEMENT_GID,
+                    "clinic": ck_clinic,
+                    "cell": cell_ref,
                     "debug": " > ".join(sync_debug),
                 }
-            sync_debug.append(f"target_sheet:{target_sheet.title}|gid:{target_sheet.id}|cell:{cell_ref}")
-            state_cell_ref = f"CK_AMK:{cell_ref}" if category == "CK" else cell_ref
+            sync_debug.append(f"target_sheet:{target_sheet.title}|gid:{target_sheet.id}|cell:{cell_ref}|clinic:{ck_clinic}")
+            state_cell_ref = f"CK:{target_sheet.id}:{cell_ref}" if category == "CK" else cell_ref
             db = SessionLocal()
             state = db.query(SheetState).filter(SheetState.cell_reference == state_cell_ref).first()
             final_amount = amount
@@ -470,6 +510,7 @@ def update_google_sheet(amount, category, filename, record_id=None):
                 "cell": cell_ref,
                 "sheet_title": audit_sheet_name,
                 "gid": target_sheet.id,
+                "clinic": ck_clinic,
                 "value": expected_amount,
                 "debug": " > ".join(sync_debug),
             }
@@ -842,11 +883,18 @@ with tab1:
                     ck_row = db.query(CKSecreterial).filter(CKSecreterial.id == rid).first()
                     db.close()
                     if ck_row:
-                        sync_result = update_google_sheet(ck_row.total_amount, "CK", preview["filename"], rid)
+                        sync_result = update_google_sheet(
+                            ck_row.total_amount,
+                            "CK",
+                            preview["filename"],
+                            rid,
+                            bill_to=ck_row.bill_to,
+                        )
                         if sync_result and sync_result.get("ok"):
                             st.session_state['auto_processed_ck'].add(file_key)
                             preview["auto_status"] = (
                                 "Saved to CK and wrote extracted total to "
+                                f"{sync_result.get('clinic', 'AMK')} clinic "
                                 f"{sync_result.get('sheet_title', 'AMK settlement')} "
                                 f"{sync_result.get('cell', 'C39')} "
                                 f"(gid: {sync_result.get('gid', CK_AMK_SETTLEMENT_GID)}) "
