@@ -458,7 +458,7 @@ def get_processor_id():
         except Exception as e:
             logger.warning(f"Unable to parse processor_id from credentials.json: {e}")
 
-    return "7303c66f56860f77"
+    return "5ec65c9f9a56298"
 
 def extract_invoice_data(text, filename=""):
     data = {'total_amount': "Not Found", 'sub_total': "Not Found", 'gst_amount': "0.00", 'remarks': ""}
