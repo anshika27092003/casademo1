@@ -173,11 +173,11 @@ def resolve_ck_amk_worksheet(spreadsheet):
     return None
 
 
-def update_ck_amk_c39_direct(final_amount):
-    """Directly write CK amount to AMK C39 via Sheets Values API (no metadata read)."""
+def update_amk_cell_direct(cell_ref, final_amount):
+    """Directly write value to AMK settlement cell via Sheets Values API (no metadata read)."""
     creds = get_sheet_credentials()
     creds.refresh(Request())
-    range_name = f"{CK_AMK_SHEET_TITLE}!C39"
+    range_name = f"{CK_AMK_SHEET_TITLE}!{cell_ref}"
     encoded_range = quote(range_name, safe="")
     url = f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}/values/{encoded_range}"
     headers = {
@@ -198,20 +198,13 @@ def update_ck_amk_c39_direct(final_amount):
 
 
 def update_fwl_sheet_for_clinic(clinic_label, amount_to_append, filename, record_id=None):
-    """Append FWL total_payable to C67 on the clinic-specific settlement tab."""
+    """Write FWL total_payable to AMK settlement C67 directly."""
     try:
-        client = get_gsheet_client()
-        spreadsheet = client.open_by_key(SHEET_ID)
-        settlement_ws = resolve_fwl_worksheet(spreadsheet, clinic_label)
-        if not settlement_ws:
-            log_to_ui(f"❌ No settlement worksheet found for clinic: {clinic_label}", type="error")
-            return
         cell_ref = FWL_SETTLEMENT_CELL
-        current_val = settlement_ws.acell(cell_ref).value
-        final_amount = format_amount(parse_amount(current_val) + parse_amount(amount_to_append))
-        settlement_ws.update_acell(cell_ref, final_amount)
+        final_amount = format_amount(parse_amount(amount_to_append))
+        update_amk_cell_direct(cell_ref, final_amount)
 
-        state_key = fwl_sheet_state_key(settlement_ws.title)
+        state_key = f"AMK:{cell_ref}:FWL"
         db = SessionLocal()
         state = db.query(SheetState).filter(SheetState.cell_reference == state_key).first()
         if not state:
@@ -220,12 +213,10 @@ def update_fwl_sheet_for_clinic(clinic_label, amount_to_append, filename, record
         else:
             state.last_value = str(final_amount)
             state.last_updated = datetime.utcnow()
-        row_num = re.findall(r"\d+", cell_ref)[0]
-        label_val = settlement_ws.acell(f"A{row_num}").value
         audit = CellChange(
-            sheet_name=settlement_ws.title,
+            sheet_name=CK_AMK_SHEET_TITLE,
             cell_reference=state_key,
-            label_name=str(label_val),
+            label_name="FWL",
             old_value="FWL Upload",
             new_value=str(final_amount),
             source_table="FWL",
@@ -235,11 +226,11 @@ def update_fwl_sheet_for_clinic(clinic_label, amount_to_append, filename, record
         db.add(audit)
         db.commit()
         db.close()
-        log_to_ui(f"✅ Synced FWL for {clinic_label} → {settlement_ws.title}!{cell_ref} (${final_amount})", type="success")
+        log_to_ui(
+            f"✅ Synced FWL to AMK settlement ({CK_AMK_SHEET_TITLE}!{cell_ref}, gid: {CK_AMK_SETTLEMENT_GID}) (${final_amount})",
+            type="success",
+        )
     except Exception as e:
-        if is_read_quota_error(e):
-            logger.warning(f"FWL read quota hit (hidden from UI): {e}")
-            return
         log_to_ui(f"❌ FWL Sheet Sync Error: {e}", type="error")
 
 def normalize_ck_payload(filename, data):
@@ -390,15 +381,16 @@ def is_duplicate_manual_change(db: Session, cell_ref: str, new_val: str) -> bool
 def update_google_sheet(amount, category, filename, record_id=None):
     sync_debug = []
     try:
-        if category == "CK":
-            # CK path: avoid open_by_key metadata reads to prevent Sheets read quota failures.
-            sync_debug.append("ck_direct_write_start")
+        if category in ("CK", "SP"):
+            # CK/SP path: avoid open_by_key metadata reads to prevent Sheets read quota failures.
+            cell_ref = "C39" if category == "CK" else "C42"
+            sync_debug.append(f"{category.lower()}_direct_write_start")
             final_amount = format_amount(parse_amount(amount))
-            update_ck_amk_c39_direct(final_amount)
-            sync_debug.append("ck_direct_write_done")
+            update_amk_cell_direct(cell_ref, final_amount)
+            sync_debug.append(f"{category.lower()}_direct_write_done")
 
             db = SessionLocal()
-            state_cell_ref = "CK_AMK:C39"
+            state_cell_ref = f"AMK:{cell_ref}:{category}"
             state = db.query(SheetState).filter(SheetState.cell_reference == state_cell_ref).first()
             if not state:
                 state = SheetState(cell_reference=state_cell_ref, last_value=str(final_amount), last_updated=datetime.utcnow())
@@ -408,11 +400,11 @@ def update_google_sheet(amount, category, filename, record_id=None):
                 state.last_updated = datetime.utcnow()
             audit = CellChange(
                 sheet_name=CK_AMK_SHEET_TITLE,
-                cell_reference="C39",
-                label_name="CK SECRETARIAL / ACCOUNTS SERVICES",
+                cell_reference=cell_ref,
+                label_name=("CK SECRETARIAL / ACCOUNTS SERVICES" if category == "CK" else "SP"),
                 old_value="OCR Upload",
                 new_value=str(final_amount),
-                source_table="CK",
+                source_table=category,
                 source_id=record_id,
                 timestamp=datetime.utcnow(),
             )
@@ -420,12 +412,12 @@ def update_google_sheet(amount, category, filename, record_id=None):
             db.commit()
             db.close()
             log_to_ui(
-                f"✅ Synced CK to AMK settlement ({CK_AMK_SHEET_TITLE}!C39, gid: {CK_AMK_SETTLEMENT_GID}) (${final_amount})",
+                f"✅ Synced {category} to AMK settlement ({CK_AMK_SHEET_TITLE}!{cell_ref}, gid: {CK_AMK_SETTLEMENT_GID}) (${final_amount})",
                 type="success",
             )
             return {
                 "ok": True,
-                "cell": "C39",
+                "cell": cell_ref,
                 "sheet_title": CK_AMK_SHEET_TITLE,
                 "gid": CK_AMK_SETTLEMENT_GID,
                 "value": final_amount,
@@ -1001,7 +993,7 @@ with tab1:
             if v.get("category") == "SP" and v.get("data") and k not in st.session_state['processed_sp_batch']
         ]
         if sp_candidates:
-            st.info(f"SP ready for batch submit: {len(sp_candidates)} file(s)")
+            st.info(f"SP ready for batch submit: {len(sp_candidates)} file(s). Target: AMK C42.")
             if st.button("✅ Submit SP Batch"):
                 sp_batch_total = 0.0
                 submitted_count = 0
@@ -1014,7 +1006,10 @@ with tab1:
                         st.session_state['processed_sp_batch'].add(file_key)
                 if submitted_count > 0:
                     update_google_sheet(format_amount(sp_batch_total), "SP", "SP Batch Submit")
-                    st.success(f"Submitted {submitted_count} SP record(s). Synced ${format_amount(sp_batch_total)} to settlement.")
+                    st.success(
+                        f"Submitted {submitted_count} SP record(s). "
+                        f"Wrote ${format_amount(sp_batch_total)} to AMK settlement C42 (gid: {CK_AMK_SETTLEMENT_GID})."
+                    )
                 else:
                     st.error("No SP records were submitted. Please check extracted values.")
 
@@ -1023,19 +1018,14 @@ with tab1:
             if v.get("category") == "FWL" and v.get("data") and k not in st.session_state['processed_fwl_batch']
         ]
         if fwl_candidates:
-            st.info(f"FWL ready for batch submit: {len(fwl_candidates)} file(s). Select clinic and confirm.")
-            fwl_clinic = st.selectbox("Clinic for FWL upload(s)", FWL_CLINICS, key="fwl_batch_clinic")
-            fwl_confirm = st.checkbox(
-                f"I confirm uploading these FWL document(s) for clinic: **{fwl_clinic}**",
-                key="fwl_batch_confirm",
-            )
-            if st.button("✅ Submit FWL Batch", disabled=not fwl_confirm):
+            st.info(f"FWL ready for batch submit: {len(fwl_candidates)} file(s). Target: AMK C67.")
+            if st.button("✅ Submit FWL Batch"):
                 fwl_batch_total = 0.0
                 submitted_count = 0
                 last_rid = None
                 failed_files = []
                 for file_key, preview in fwl_candidates:
-                    inv = normalize_fwl_payload(preview["data"], clinic_name=fwl_clinic)
+                    inv = normalize_fwl_payload(preview["data"], clinic_name="AMK")
                     rid = save_to_db(preview["filename"], inv, "FWL")
                     if rid:
                         submitted_count += 1
@@ -1046,14 +1036,15 @@ with tab1:
                         failed_files.append(preview["filename"])
                 if submitted_count > 0:
                     update_fwl_sheet_for_clinic(
-                        fwl_clinic,
+                        "AMK",
                         format_amount(fwl_batch_total),
                         "FWL Batch Submit",
                         last_rid,
                     )
                     st.success(
-                        f"Submitted {submitted_count} FWL record(s) for {fwl_clinic}. "
-                        f"Appended ${format_amount(fwl_batch_total)} to {FWL_SETTLEMENT_CELL} on that clinic's sheet."
+                        f"Submitted {submitted_count} FWL record(s). "
+                        f"Wrote ${format_amount(fwl_batch_total)} to AMK settlement {FWL_SETTLEMENT_CELL} "
+                        f"(gid: {CK_AMK_SETTLEMENT_GID})."
                     )
                     if failed_files:
                         st.warning(
