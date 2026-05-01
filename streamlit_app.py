@@ -72,9 +72,8 @@ FWL_CLINIC_WORKSHEET_KEY = {
     "BOON KENG / BK": "BOON KENG",
 }
 FWL_SETTLEMENT_CELL = "C67"
-SHEET_POLL_INTERVAL_SECONDS = 60
-FOREGROUND_SYNC_COOLDOWN_SECONDS = 45
-ENABLE_FWL_MANUAL_SCAN = False
+SHEET_POLL_INTERVAL_SECONDS = 5
+FOREGROUND_SYNC_COOLDOWN_SECONDS = 5
 
 def _load_service_account_info():
     try:
@@ -395,10 +394,10 @@ def get_tracker_manager():
 def background_polling_loop():
     logger.info("Background tracker started.")
     while True:
-        sync_sheet_changes_once(include_fwl_manual_scan=ENABLE_FWL_MANUAL_SCAN)
+        sync_sheet_changes_once()
         time.sleep(SHEET_POLL_INTERVAL_SECONDS)
 
-def sync_sheet_changes_once(include_fwl_manual_scan=False):
+def sync_sheet_changes_once():
     cells = ["C39", "C42"]
     db = None
     try:
@@ -444,53 +443,7 @@ def sync_sheet_changes_once(include_fwl_manual_scan=False):
                 
                 logger.info(f"SUCCESS: Recorded manual change in {cell_ref} as {normalized_current_val}")
 
-        if include_fwl_manual_scan:
-            # FWL: each clinic tab has its own C67 — optional (costly) scan.
-            for clinic_label in FWL_CLINICS:
-                fwl_ws = resolve_fwl_worksheet(spreadsheet, clinic_label)
-                if not fwl_ws:
-                    continue
-                cell_ref = FWL_SETTLEMENT_CELL
-                state_key = fwl_sheet_state_key(fwl_ws.title)
-                current_val = format_amount(parse_amount(fwl_ws.acell(cell_ref).value or "0"))
-                state = db.query(SheetState).filter(SheetState.cell_reference == state_key).first()
-                if not state:
-                    db.add(SheetState(cell_reference=state_key, last_value=current_val, last_updated=datetime.utcnow()))
-                    db.commit()
-                    continue
-                last_logged_val = format_amount(parse_amount(state.last_value))
-                if current_val != last_logged_val:
-                    row_num = re.findall(r"\d+", cell_ref)[0]
-                    label_val = fwl_ws.acell(f"A{row_num}").value
-                    if is_duplicate_manual_change(db, state_key, current_val):
-                        state.last_value = current_val
-                        state.last_updated = datetime.utcnow()
-                        db.commit()
-                        continue
-                    entry = FWLTable(
-                        filename="Manual Entry",
-                        clinic_name=clinic_label,
-                        total_payable=current_val,
-                        remarks="Manual edit in Sheet",
-                        timestamp=datetime.utcnow(),
-                    )
-                    db.add(entry)
-                    db.flush()
-                    audit = CellChange(
-                        sheet_name=fwl_ws.title,
-                        cell_reference=state_key,
-                        label_name=str(label_val),
-                        old_value=last_logged_val,
-                        new_value=current_val,
-                        source_table="FWL",
-                        source_id=entry.id,
-                        timestamp=datetime.utcnow(),
-                    )
-                    state.last_value = current_val
-                    state.last_updated = datetime.utcnow()
-                    db.add(audit)
-                    db.commit()
-                    logger.info(f"SUCCESS: Recorded FWL manual change {fwl_ws.title} {cell_ref} as {current_val}")
+        # FWL manual polling removed by request.
     except Exception as e:
         logger.error(f"Polling error: {e}")
     finally:
@@ -659,7 +612,7 @@ Base.metadata.create_all(bind=engine)
 now_ts = time.time()
 last_sync_ts = st.session_state.get("last_foreground_sheet_sync_ts", 0.0)
 if now_ts - last_sync_ts >= FOREGROUND_SYNC_COOLDOWN_SECONDS:
-    sync_sheet_changes_once(include_fwl_manual_scan=False)
+    sync_sheet_changes_once()
     st.session_state["last_foreground_sheet_sync_ts"] = now_ts
 start_background_tracker()
 
@@ -667,7 +620,7 @@ tab1, tab2 = st.tabs(["📤 Upload Documents (OCR)", "📋 View Records"])
 
 with tab1:
     st.subheader("🚀 Upload Invoices")
-    uploaded_files = st.file_uploader("Drop invoice images", type=['png', 'jpg', 'jpeg'], accept_multiple_files=True)
+    uploaded_files = st.file_uploader("Drop invoice images or PDFs", type=['png', 'jpg', 'jpeg', 'pdf'], accept_multiple_files=True)
     
     if uploaded_files:
         if 'ocr_preview' not in st.session_state:
