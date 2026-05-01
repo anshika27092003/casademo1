@@ -356,14 +356,8 @@ def update_google_sheet(amount, category, filename, record_id=None):
             state = db.query(SheetState).filter(SheetState.cell_reference == state_cell_ref).first()
             final_amount = amount
             if category == "CK":
-                # Prefer DB-tracked state for append baseline to avoid read quota failures.
-                baseline_val = state.last_value if state else "0"
-                if parse_amount(baseline_val) == 0:
-                    try:
-                        baseline_val = call_with_quota_retry(lambda: target_sheet.acell(cell_ref).value or "0")
-                    except Exception:
-                        baseline_val = "0"
-                final_amount = format_amount(parse_amount(baseline_val) + parse_amount(amount))
+                # CK flow requirement: write extracted total_amount directly into C39.
+                final_amount = format_amount(parse_amount(amount))
 
             # Perform update
             call_with_quota_retry(lambda: target_sheet.update_acell(cell_ref, final_amount))
@@ -765,7 +759,7 @@ with tab1:
                         if sync_result and sync_result.get("ok"):
                             st.session_state['auto_processed_ck'].add(file_key)
                             preview["auto_status"] = (
-                                "Saved to CK and synced to "
+                                "Saved to CK and wrote extracted total to "
                                 f"{sync_result.get('sheet_title', 'AMK settlement')} "
                                 f"{sync_result.get('cell', 'C39')} "
                                 f"(gid: {sync_result.get('gid', CK_AMK_SETTLEMENT_GID)}) "
